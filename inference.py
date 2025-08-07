@@ -84,9 +84,9 @@ if __name__ == '__main__':
 
     model_type = 'eval'
     dp_model = dataset_params.get_model_params(
-        p['bop_root'], p['dataset'], model_type)
+        p['bop_root'], 'ycbv', model_type)
     dp_data = dataset_params.get_split_params(
-        p['bop_root'], p['dataset'], 'test')
+        p['bop_root'],'ycbv', 'test')
     with open(dp_model['models_info_path'], 'r') as fp:
         model_info = json.load(fp)
 

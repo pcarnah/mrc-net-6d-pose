@@ -14,6 +14,11 @@ def process_folder(rank, obj_folder, model_folder, n_objs=30):
     image_folder = obj_folder / 'rgb'
     image_files = list(image_folder.glob('*.png')) \
         + list(image_folder.glob('*.jpg'))
+
+    image_folder = obj_folder / 'gray'
+    image_files += list(image_folder.glob('*.tif'))
+    image_files += list(image_folder.glob('*.bmp'))
+
     model_dict = dict()
     symmetries = dict()
     with open(model_folder / 'models_info.json', 'r') as fp:
@@ -87,7 +92,7 @@ if __name__ == '__main__':
     root_dir = Path(cfg.DATASET_ROOT)
     obj_dataset = args.dataset
     n_objs = cfg.DATASET_CONFIG[obj_dataset]['num_class']
-    max_procs = 8
+    max_procs = 4
     gpu_count = torch.cuda.device_count()
     for data_folder, model_path in cfg.DATASET_CONFIG[
             obj_dataset]['model_folders'].items():

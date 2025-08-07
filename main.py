@@ -64,6 +64,10 @@ def main_worker(rank, world_size, args):
         depth_max=data_info['depth_max'],
         n_depth_bin=bop_cfg.Tz_BINS_NUM).to(rank)
 
+    checkpoint = torch.load('chk_usprobe/mrcnet_ycb_usprobe.pth', map_location=torch.device(rank))
+    print('loading pre-trained model')
+    model.load_state_dict(checkpoint['network'])
+
     if args.is_parallel:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[rank], static_graph=True,

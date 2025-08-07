@@ -21,8 +21,8 @@ POSE_SIGMA = 0.03  # standard deviation of quaternion bin distribution
 DEPTH_SIGMA = 0.5     # standard deviation of depth Gaussian distribution
 TRANS_SIGMA = 10 / INPUT_SIZE  # standard deviation of noise in 2D center
 
-DATASET_ROOT = "./data/bop_datasets"
-EVAL_ROOT = "./data/bop_datasets_eval"
+DATASET_ROOT = "D:/6DPose"
+EVAL_ROOT = "D:/6DPose"
 VOC_BG_ROOT = "./data/VOCdevkit/VOC2012"
 
 END_LR = 5e-6
@@ -107,4 +107,35 @@ DATASET_CONFIG = {
         'finetune_set': ['train'],
         'test_set': ['test'],
     },  # √
+    'ycbv-ds': {
+        'width': 640,
+        'height': 480,
+        'Tz_near': 0.030,
+        'Tz_far': 2.000,
+        'num_class': 21,
+        'id2mod': {v+1: "obj_{:02d}".format(v+1) for v in range(21)},
+        'id2cls': {v+1: v for v in range(21)},  # from object_id to class_index
+        'model_folders': {
+            'train_pbr': 'models',
+            'train_pbr_left': 'models',
+            'test': 'models_eval'},
+        'train_set': ['train_pbr_left'],
+        'test_set': ['test~left_pbr'],
+    },
+    'usprobe': {
+        'width': 1280,
+        'height': 720,
+        'Tz_near': 0.010,
+        'Tz_far': 2.000,
+        'num_class': 4,
+        'id2mod': {v+1: "obj_{:02d}".format(v+1) for v in range(4)},
+        'id2cls': {v+1: v for v in range(4)},  # from object_id to class_index
+        'model_folders': {
+            'train': 'models',
+            # 'train_pbr': 'models',
+            'test': 'models_eval'
+        },
+        'train_set': ['train'],
+        'test_set': ['test'],
+    }
 }

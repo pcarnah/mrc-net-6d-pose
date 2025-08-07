@@ -215,12 +215,14 @@ class BOP_Dataset(torch.utils.data.Dataset):
                     scene_gt_bbox_dict = mmcv.load(os.path.join(scene_dir, "scene_gt_info.json"))  # gt_bboxes
                     for img_id_str in tqdm(scene_gt_pose_dict, postfix=f"{scene_id}"):  # image
                         img_id_int = int(img_id_str)
-                        color_type = "gray" if dataset_name == 'itodd' else "rgb"
+                        color_type = "gray" if dataset_name == 'itodd' or dataset_name == 'usprobe' else "rgb"
                         rgb_path = os.path.join(scene_dir, "{}/{:06d}.jpg").format(color_type, img_id_int)
                         if not os.path.exists(rgb_path):
                             rgb_path = os.path.join(scene_dir, "{}/{:06d}.png").format(color_type, img_id_int)
                         if not os.path.exists(rgb_path):
                             rgb_path = os.path.join(scene_dir, "{}/{:06d}.tif").format(color_type, img_id_int)
+                        if not os.path.exists(rgb_path):
+                            rgb_path = os.path.join(scene_dir, "{}/{:06d}.bmp").format(color_type, img_id_int)
                         assert os.path.exists(rgb_path), rgb_path
                         cam_K = np.array(scene_cam_dict[img_id_str]["cam_K"], dtype=np.float32).reshape(3, 3)
 
