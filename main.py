@@ -64,7 +64,7 @@ def main_worker(rank, world_size, args):
         depth_max=data_info['depth_max'],
         n_depth_bin=bop_cfg.Tz_BINS_NUM).to(rank)
 
-    checkpoint = torch.load('chk_usprobe/mrcnet_ycb_usprobe.pth', map_location=torch.device(rank))
+    checkpoint = torch.load('chk_usprobe/mrcnet_ycb_usprobe.pth', map_location=torch.device(rank), weights_only=True)
     print('loading pre-trained model')
     model.load_state_dict(checkpoint['network'])
 

@@ -132,7 +132,7 @@ DATASET_CONFIG = {
         'id2cls': {v+1: v for v in range(4)},  # from object_id to class_index
         'model_folders': {
             'train': 'models',
-            # 'train_pbr': 'models',
+            'train_pbr': 'models',
             'test': 'models_eval'
         },
         'train_set': ['train'],

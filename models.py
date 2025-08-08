@@ -1,3 +1,5 @@
+import torchvision
+
 import utils
 import torch
 import math
@@ -82,8 +84,10 @@ class ResNet34_AsymUNet(nn.Module):
         norm_layer = partial(
             nn.BatchNorm2d, track_running_stats=track_running_stats)
         model = model_zoo.resnet34(norm_layer=norm_layer)
-        ResNet34_Weights_IMAGENET1K_V1 = torch.hub.load_state_dict_from_url(
-            'https://download.pytorch.org/models/resnet34-b627a593.pth')
+        # ResNet34_Weights_IMAGENET1K_V1 = torch.hub.load_state_dict_from_url(
+        #     'https://download.pytorch.org/models/resnet34-b627a593.pth')
+        # model.load_state_dict(ResNet34_Weights_IMAGENET1K_V1, strict=False)
+        ResNet34_Weights_IMAGENET1K_V1 = model_zoo.resnet34(weights=model_zoo.ResNet34_Weights.IMAGENET1K_V1).state_dict()
         model.load_state_dict(ResNet34_Weights_IMAGENET1K_V1, strict=False)
         # Remove last pooling and fc layer
         self.base_model = torch.nn.Sequential(*(list(model.children())[:-2]))
