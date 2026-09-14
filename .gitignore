@@ -166,6 +166,8 @@ runs*/
 *.pth
 checkpoints/
 data/
+bop22_default_detections_and_segmentations/
+logs/
 results/
 output*/
 *cache*/

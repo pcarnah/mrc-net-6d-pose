@@ -7,4 +7,6 @@ pycocotools==2.0.7
 tqdm==4.66.3
 trimesh==4.0.10
 tensorboard==2.10.1
+triton >= 2.1; sys_platform != 'win32'
+triton-windows >= 3.0; sys_platform == 'win32'
 git+https://github.com/pcarnah/bop_toolkit.git

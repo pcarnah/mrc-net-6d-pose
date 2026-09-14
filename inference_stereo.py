@@ -19,6 +19,14 @@ import pycocotools.mask as cocomask
 root_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(root_dir)
 
+def timed(fn):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = fn()
+    end.record()
+    torch.cuda.synchronize()
+    return result, start.elapsed_time(end) / 1000
 
 def rle2mask(rle, height, width):
     if "counts" in rle and isinstance(rle["counts"], list):
@@ -76,8 +84,8 @@ if __name__ == '__main__':
 
     p = {
         'dataset': args.dataset,
-        'bop_root': r'D:\6DPose',
-        'eval_root': r'D:\6DPose',
+        'bop_root': r'/mnt/d/6DPose',
+        'eval_root': r'/mnt/d/6DPose',
         'output_suffix_name': '{}_{}'.format(
             args.checkpoint_name, args.output_suffix),
         'checkpoint': './{}/{}.pth'.format(args.checkpoint_name,
@@ -108,6 +116,8 @@ if __name__ == '__main__':
     print('loading pre-trained model from {}'.format(p['checkpoint']))
     net.load_state_dict(checkpoint['network'])
     net.eval()
+
+    net = torch.compile(net)
 
     est_pose_file = '{}/mrcnet_{}-test_{}.csv'.format(
         p['eval_root'], p['dataset'], p['output_suffix_name'])
@@ -193,6 +203,11 @@ if __name__ == '__main__':
             view_rgb_file = os.path.join(
                 # gray images in usprobe
                 scene_dir, 'gray', '{:06d}.bmp'.format(view_id))
+        if not os.path.exists(view_rgb_file):
+            view_rgb_file = os.path.join(
+                # gray images in usprobe
+                scene_dir, 'gray', '{:06d}.png'.format(view_id))
+
 
         view_cam_K = np.asarray(
             scene_camK[str(view_id)]['cam_K'],
@@ -287,9 +302,10 @@ if __name__ == '__main__':
             b_fov = np.stack(b_fov, axis=0)
             b_Rz = np.stack(b_Rz, axis=0)
 
-            est_R, est_t = inference_func(
+            (est_R, est_t), run_time = timed(lambda: inference_func(
                 net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
-                b_roi_camK, b_fov, b_Rz)
+                b_roi_camK, b_fov, b_Rz))
+            print(run_time)
 
             view_objs_ts.append(est_t)
             view_objs_Rs.append(est_R)

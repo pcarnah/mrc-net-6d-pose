@@ -177,7 +177,7 @@ def main_worker(rank, world_size, args):
                 scheduler.step()
 
             # Save models; this only needs to be done in one replica
-            if world_rank == 0:
+            if world_rank == 0 and epoch % 10 == 0:
                 if args.is_parallel:
                     state_dict = {
                         'network': model.module.state_dict(),
