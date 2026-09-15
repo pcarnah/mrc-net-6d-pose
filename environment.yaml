@@ -1,0 +1,15 @@
+name: mrcnet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - scikit-image
+  - ipython
+  - opencv=4.10
+  - tqdm
+  - numba
+  - numpy<=1.26
+  - tensorboard>=2.10
+  - cuda-toolkit=12.8
+  - cuda-nvcc=12.8

@@ -9,6 +9,8 @@ from torchvision import models as model_zoo
 import config as cfg
 from functools import partial
 from spatial_correlation_sampler import SpatialCorrelationSampler
+from object_registry import ObjectRegistry
+import rendering
 
 
 class ConvGnReLU(nn.Module):
@@ -356,23 +358,26 @@ class RegressionHead(nn.Module):
 
 
 class MRCNet(nn.Module):
-    def __init__(self, dataset='tless', n_decoders=1, depth_min=0.05,
-                 depth_max=2.0, n_depth_bin=1000):
+    def __init__(self, cfg):
         super(MRCNet, self).__init__()
 
         self.backbone = ResNet34_AsymUNet(
-            n_decoders=n_decoders, track_running_stats=False, rgb_input_dim=4)
+            n_decoders=cfg.n_decoders, track_running_stats=False,
+            rgb_input_dim=4)
         self.decoder = PoseDecoder()
         self.classifier = ClassificationHead(
-            n_pose_bins=cfg.N_POSE_BIN, n_depth_bins=n_depth_bin)
+            n_pose_bins=cfg.n_pose_bin, n_depth_bins=cfg.n_depth_bin)
         self.regressor = RegressionHead(
-            dim_pose=6 if cfg.USE_6D else 4)
-        self.renderer = utils.SyntheticRenderer(
-            cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE, dataset=dataset)
+            dim_pose=6 if cfg.use_6d else 4)
+        self.registry = ObjectRegistry(cfg.dataset)
+        self.renderer = rendering.Pytorch3DRenderer(
+            cfg.input_img_size, cfg.input_img_size, self.registry)
 
-        self.depth_min = depth_min
-        self.depth_max = depth_max
-        self.n_depth_bin = n_depth_bin
+        self.depth_min = cfg.depth_min
+        self.depth_max = cfg.depth_max
+        self.n_depth_bin = cfg.n_depth_bin
+        self.n_pose_bin = cfg.n_pose_bin
+        self.use_6d = cfg.use_6d
 
     def _make_predictions(self, mask_real, mask_synt, pose_logits,
                           depth_logits, trans_logits, pose_res,
@@ -382,7 +387,7 @@ class MRCNet(nn.Module):
             self.n_depth_bin)
         trans_xy = utils.trans_from_bins(trans_logits, trans_res)
         trans_persp = torch.concat([trans_xy, depth], dim=-1)
-        if cfg.USE_6D:
+        if self.use_6d:
             rot_ego = utils.rotation_from_prototypes(pose_logits, pose_res)
         else:
             quaternions = utils.quaternion_from_prototypes(
@@ -427,11 +432,15 @@ class MRCNet(nn.Module):
 
             pose_id = torch.argmax(pose_logits, dim=-1)
             quat_init = utils.quaternion_from_bin_logits(F.one_hot(
-                pose_id, num_classes=cfg.N_POSE_BIN))
+                pose_id, num_classes=self.n_pose_bin))
             rot_init = utils.quaternion_to_rotation(quat_init)
 
-            render, render_mask, render_map = self.renderer(
-                aux['obj_cls'], rot_init, trans_3d, aux['intrinsics'])
+            out = self.renderer.render(
+                aux['obj_cls'], rot_init, trans_3d,
+                [rendering.CameraView(K=aux['intrinsics'])])
+            render = out['rgb'][:, 0]
+            render_mask = out['mask'][:, 0]
+            render_map = out['bbox_map'][:, 0]
 
         sync_inputs = torch.concat([render, render_map], dim=1)
         x2, mask_synt = self.backbone(sync_inputs, aux['obj_cls'])
@@ -452,38 +461,38 @@ class MRCNet(nn.Module):
             targets['quat_init'] = quat_init
             targets['trans_2d'] = trans_xy
             targets['depth_id'] = depth_id
-            targets['mask_synt'] = render_mask
             predictions['losses'] = self._compute_loss(predictions, targets)
         return predictions
 
     def _compute_loss(self, predictions, targets):
-        assert 'quat_ego' in targets
+        assert 'roi_obj_R' in targets
 
         loss_dict = {}
         image_size = (cfg.INPUT_SIZE, cfg.INPUT_SIZE)  # constant
 
-        quat_gt = targets['quat_ego']
+        quat_gt = utils.rotation_to_quaternion(targets['roi_obj_R'])
         trans_gt = targets['roi_obj_t']
         quat_pred = utils.rotation_to_quaternion(predictions['roi_obj_R'])
         trans_pred = utils.perspective_to_trans_3d(
             predictions['translation'], image_size, targets['roi_camK'])
+        cad = self.registry.gather(targets['obj_cls'])
         quat_gt, trans_gt = utils.top_matched_pose(
             quat_gt, trans_gt, quat_pred, trans_pred,
-            targets['vertices_correlation'], targets['vertices_mean'],
-            targets['quaternion_symmetries'],
-            targets['translation_symmetries'], targets['symmetries_mask'])
+            cad['vertices_correlation'],
+            cad['quaternion_symmetries'],
+            cad['translation_symmetries'], cad['symmetries_mask'])
 
         loss_dict = utils.vertex_rotation_loss(
             predictions['quat_bin'], predictions['quat_res'],
             quat_gt, targets['quat_bin'], targets['quat_init'],
-            targets['vertices'], targets['vertices_mask'],
-            image_size, targets['roi_camK'])
+            cad['vertices'], cad['vertices_mask'],
+            image_size, targets['roi_camK'], self.use_6d)
 
         loss_trans_dict = utils.vertex_translation_loss(
             predictions['trans_logits'], predictions['trans_res'],
             targets['trans_2d'], trans_gt, predictions['depth_bin'],
             predictions['depth_res'], targets['depth_id'], targets['roi_camK'],
-            targets['roi_obj_R'], image_size,
+            image_size,
             self.depth_min, self.depth_max, self.n_depth_bin)
         loss_dict.update(loss_trans_dict)
 

@@ -30,7 +30,6 @@ if ! [ -d ./data/bop_datasets/tless ]; then
   unzip ./data/bop_datasets/tless_test_primesense_all.zip -d ./data/bop_datasets/tless
   wget https://bop.felk.cvut.cz/media/data/bop_datasets/tless_models.zip -P ./data/bop_datasets
   unzip ./data/bop_datasets/tless_models.zip -d ./data/bop_datasets/tless
-  python precompute_quaternion_labels.py --dataset tless
   python -c 'import bop_dataset; bop_dataset.BOP_Dataset("tless", split="train")'
 fi
 
@@ -43,7 +42,6 @@ if ! [ -d ./data/bop_datasets/lmo ]; then
   unzip ./data/bop_datasets/lmo_test_all.zip -d ./data/bop_datasets/lmo
   wget https://bop.felk.cvut.cz/media/data/bop_datasets/lm_models.zip -P ./data/bop_datasets
   unzip ./data/bop_datasets/lm_models.zip -d ./data/bop_datasets/lmo
-  python precompute_quaternion_labels.py --dataset lmo
   python -c 'import bop_dataset; bop_dataset.BOP_Dataset("lmo", split="train")'
 fi
 
@@ -58,7 +56,6 @@ if ! [ -d ./data/bop_datasets/ycbv ]; then
   unzip ./data/bop_datasets/ycbv_test_all.zip -d ./data/bop_datasets/ycbv
   wget https://bop.felk.cvut.cz/media/data/bop_datasets/ycbv_models.zip -P ./data/bop_datasets
   unzip ./data/bop_datasets/ycbv_models.zip -d ./data/bop_datasets/ycbv
-  python precompute_quaternion_labels.py --dataset ycbv
   python -c 'import bop_dataset; bop_dataset.BOP_Dataset("ycbv", split="train")'
 fi
 
@@ -71,6 +68,5 @@ if ! [ -d ./data/bop_datasets/itodd ]; then
   unzip ./data/bop_datasets/itodd_test_all.zip -d ./data/bop_datasets/itodd
   wget https://bop.felk.cvut.cz/media/data/bop_datasets/itodd_models.zip -P ./data/bop_datasets
   unzip ./data/bop_datasets/itodd_models.zip -d ./data/bop_datasets/itodd
-  python precompute_quaternion_labels.py --dataset itodd
   python -c 'import bop_dataset; bop_dataset.BOP_Dataset("itodd", split="train")'
 fi

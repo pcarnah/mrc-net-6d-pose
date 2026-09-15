@@ -1,5 +1,6 @@
 import os
 import cv2
+import dataclasses
 import torch
 import random
 import numpy as np
@@ -43,7 +44,8 @@ def main_worker(rank, world_size, args):
 
     train_dataset = data.BOP_Dataset(
         args.dataset, split='train')
-    data_info = train_dataset.get_info()
+
+    model_config = bop_cfg.ModelConfig.from_dataset_config(args.dataset)
 
     if args.is_parallel:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset)
@@ -54,19 +56,16 @@ def main_worker(rank, world_size, args):
         train_dataset, batch_size=args.batch_size,
         shuffle=train_sampler is None,
         pin_memory=True, num_workers=args.num_workers,
-        drop_last=True, sampler=train_sampler,
-        collate_fn=data.collate_fn)
+        drop_last=True, sampler=train_sampler)
 
-    model = models.MRCNet(
-        dataset=args.dataset,
-        n_decoders=data_info['num_objects'],
-        depth_min=data_info['depth_min'],
-        depth_max=data_info['depth_max'],
-        n_depth_bin=bop_cfg.Tz_BINS_NUM).to(rank)
+    model = models.MRCNet(model_config).to(rank)
 
-    checkpoint = torch.load('chk_usprobe/mrcnet_ycb_usprobe.pth', map_location=torch.device(rank), weights_only=True)
-    print('loading pre-trained model')
-    model.load_state_dict(checkpoint['network'])
+    if args.pretrained:
+        checkpoint = torch.load(
+            args.pretrained, map_location=torch.device(rank),
+            weights_only=True)
+        print('loading pre-trained model from {}'.format(args.pretrained))
+        model.load_state_dict(checkpoint['network'])
 
     if args.is_parallel:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -122,12 +121,8 @@ def main_worker(rank, world_size, args):
             os.makedirs(args.chkpt_dir)
 
     train_step = 0
-    target_keys = ['quat_ego', 'roi_obj_R', 'fov',
-                   'roi_obj_t', 'vertices', 'vertices_mean', 'bbox_map',
-                   'obj_id', 'obj_cls', 'roi_mask', 'quat_bin', 'diameter',
-                   'vertices_mask', 'quaternion_symmetries',
-                   'translation_symmetries', 'symmetries_mask',
-                   'vertices_correlation', 'roi_camK']
+    gpu_keys = ['roi_obj_R', 'roi_obj_t', 'roi_mask', 'quat_bin',
+                'roi_camK', 'obj_cls', 'fov']
     for epoch in range(start_epoch, args.n_epochs):
         if args.is_parallel:
             train_sampler.set_epoch(epoch)
@@ -136,16 +131,12 @@ def main_worker(rank, world_size, args):
                   total=len(train_loader), disable=rank != 0) as pbar:
             for it, batch in enumerate(train_loader):
                 model.train()
-                batch_image = batch['roi_image']
-                batch_image = batch_image.to(rank, non_blocking=True)
-                batch_bbox_map = batch['bbox_map'].to(rank, non_blocking=True)
                 batch_image_roi = torch.concat([
-                    batch_image, batch_bbox_map], dim=1)
+                    batch['roi_image'].to(rank, non_blocking=True),
+                    batch['bbox_map'].to(rank, non_blocking=True)], dim=1)
 
-                targets = dict()
-                for key in target_keys:
-                    batch_value = batch[key].to(rank, non_blocking=True)
-                    targets[key] = batch_value
+                targets = {key: batch[key].to(rank, non_blocking=True)
+                           for key in gpu_keys}
 
                 predictions = model(
                     batch_image_roi,
@@ -183,12 +174,14 @@ def main_worker(rank, world_size, args):
                         'network': model.module.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
+                        'model_config': dataclasses.asdict(model_config),
                         'last_epoch': epoch}
                 else:
                     state_dict = {
                         'network': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
+                        'model_config': dataclasses.asdict(model_config),
                         'last_epoch': epoch}
                 model_path = os.path.join(
                     args.chkpt_dir, 'epoch_{:03d}.pth'.format(epoch))
@@ -217,6 +210,9 @@ if __name__ == '__main__':
                         help='directory holding all model checkpoints')
     parser.add_argument('--warmup_step', type=int, default=1000,
                         help='number of steps to warmup learning rate')
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='optional checkpoint to initialise the network '
+                             'from (fresh init when omitted)')
     args = parser.parse_args()
 
     if args.is_parallel:

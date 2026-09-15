@@ -1,3 +1,11 @@
+"""DEPRECATED.
+
+Quaternion-bin labels are now generated automatically (and cached) by
+``bop_dataset.BOP_Dataset`` on first use; see ``_generate_quat_labels`` and
+``_verify_quat_labels`` there.  This script is kept only for reference and
+will be removed in a later cleanup.  The exported ``quat_label/*.npy``
+sidecars it produced are no longer read by anything.
+"""
 import json
 import torch
 import utils

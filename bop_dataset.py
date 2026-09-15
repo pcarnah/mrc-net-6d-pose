@@ -1,31 +1,34 @@
 import os
 import sys
 import cv2
-import copy
-import json
 import mmcv
 import torch
 import random
 import hashlib
 import numpy as np
-import pytorch3d.structures
 from tqdm import tqdm
 import os.path as osp
-import torch.nn.functional as F
-import trimesh
 import utils
 import config as cfg
+from dataset_schema import PoseDataset
+from object_registry import ObjectRegistry, SYMMETRY_EPS
 
 import logging
 logger = logging.getLogger(__name__)
-
-from pytorch3d.transforms import euler_angles_to_matrix
-from typing import Dict, List
 
 CUR_FILE_DIR = os.path.dirname(__file__)
 PROJ_ROOT = os.path.abspath(os.path.join(CUR_FILE_DIR, '..'))
 sys.path.append(PROJ_ROOT)
 cv2.setNumThreads(0)
+
+SCHEMA_VERSION = 'v2'
+
+# Quaternion-bin label generation is chunked on GPU; one sample of the
+# inner computation materializes (N, N_POSE_BIN, V, 3). Budget in bytes and
+# a hard cap keep peak memory bounded across datasets/objects.
+QUAT_LABEL_MEM_BUDGET = 3_000_000_000
+QUAT_LABEL_CHUNK_MAX = 16
+QUAT_LABEL_GATE_INSTANCES = 200
 
 from lib import data_utils as misc
 
@@ -67,56 +70,7 @@ class DropoutWithMask(CoarseDropout):
         return batch
 
 
-def collate_fn(batch: List[Dict]):  # pragma: no cover
-    """
-    Take a list of objects in the form of dictionaries and merge them
-    into a single dictionary. This function can be used with a Dataset
-    object to create a torch.utils.data.Dataloader which directly
-    returns Meshes objects.
-
-    Modified from pytorch3d.datasets.collate_batched_meshes
-
-    Args:
-        batch: List of dictionaries containing information about objects
-            in the dataset.
-
-    Returns:
-        collated_dict: Dictionary of collated lists. If batch contains
-        vertices, a collated vertices batch (padded with nan) is returned.
-    """
-    if batch is None or len(batch) == 0:
-        return None
-    collated_dict = {}
-    for k in batch[0].keys():
-        collated_dict[k] = [d[k] for d in batch]
-
-    for k in ["vertices", "normals", "quaternion_symmetries",
-              "translation_symmetries"]:
-        if k not in collated_dict:
-            continue
-
-        elem_padded = pytorch3d.structures.list_to_padded(
-            collated_dict[k], pad_value=np.nan)
-        mask = torch.logical_not(torch.isnan(
-            elem_padded[..., 0]))
-        elem_padded[torch.isnan(elem_padded)] = 0.0
-        collated_dict[k] = elem_padded
-
-        if k == "vertices":
-            collated_dict["vertices_mask"] = mask
-        elif k == "quaternion_symmetries":
-            collated_dict["symmetries_mask"] = mask
-
-    for k, v in collated_dict.items():
-        if k not in ["vertices", "normals", "vertices_mask",
-                     "quaternion_symmetries", "translation_symmetries",
-                     "symmetries_mask"]:
-            collated_dict[k] = torch.utils.data.default_collate(v)
-
-    return collated_dict
-
-
-class BOP_Dataset(torch.utils.data.Dataset):
+class BOP_Dataset(PoseDataset):
     def __init__(self, dataset_name, split, rank=0):
         self.dataset_name = dataset_name
         self.rgb_size = cfg.INPUT_IMG_SIZE
@@ -125,6 +79,7 @@ class BOP_Dataset(torch.utils.data.Dataset):
 
         self.width = cfg.DATASET_CONFIG[dataset_name]['width']
         self.height = cfg.DATASET_CONFIG[dataset_name]['height']
+        self.color_type = cfg.DATASET_CONFIG[dataset_name]['color_type']
         self.split = split
 
         self.depth_min = cfg.DATASET_CONFIG[dataset_name]['Tz_near']
@@ -174,40 +129,31 @@ class BOP_Dataset(torch.utils.data.Dataset):
         self.cache_dir = os.path.join(CUR_FILE_DIR, ".cache")  # .cache
 
         hashed_file_name = hashlib.md5(("_".join(self.name_set)
-            + "dataset_dicts_{}_{}_{}".format(self.dataset_name, self.data_dir, __name__)
+            + "dataset_dicts_{}_{}_{}_{}".format(
+                SCHEMA_VERSION, self.dataset_name, self.data_dir, __name__)
         ).encode("utf-8")).hexdigest()
         cache_path = os.path.join(self.cache_dir,
             "dataset_dicts_{}_{}_{}.pkl".format(self.dataset_name, "_".join(self.name_set), hashed_file_name))
-        symmetries_cache_path = os.path.join(self.cache_dir,
-            "symm_dataset_dicts_{}_{}_{}.pkl".format(self.dataset_name, "_".join(self.name_set), hashed_file_name))
-        cad_cache_path = os.path.join(self.cache_dir,
-            "cad_dataset_dicts_{}_{}_{}.pkl".format(self.dataset_name, "_".join(self.name_set), hashed_file_name))
 
         self.model_folders = cfg.DATASET_CONFIG[dataset_name]['model_folders']
 
         self.dataset_dicts = list()
-        if self.use_cache and os.path.exists(cache_path) and os.path.exists(symmetries_cache_path) and os.path.exists(cad_cache_path):
+        if self.use_cache and os.path.exists(cache_path):
             # print("load cached dataset dicts from {}".format(cache_path))
             self.dataset_dicts = mmcv.load(cache_path)
             # print('done')
-            self.symmetries_dict = mmcv.load(symmetries_cache_path)
-            self.cad_model_dict = mmcv.load(cad_cache_path)
         else:
-            self.symmetries_dict = dict()
-            self.cad_model_dict = dict()
             for img_type in self.name_set:
                 image_counter = 0
                 instance_counter = 0
                 train_dir = os.path.join(self.data_dir, img_type)
                 logger.info("preparing data from {}".format(img_type))
-                ## load CAD model related information ##
                 model_folder = os.path.join(self.data_dir, self.model_folders[img_type])
-                self.load_model_data(model_folder, img_type)
 
                 ## process scene and images ############
                 for scene in sorted(os.listdir(train_dir)):  # scene
                     if not scene.startswith('00'):  # BOP images start with '0000xx'
-                        return
+                        continue
                     scene_id = int(scene)
                     scene_dir = os.path.join(train_dir, scene)
                     scene_cam_dict = mmcv.load(os.path.join(scene_dir, "scene_camera.json"))      # gt_intrinsic
@@ -215,7 +161,7 @@ class BOP_Dataset(torch.utils.data.Dataset):
                     scene_gt_bbox_dict = mmcv.load(os.path.join(scene_dir, "scene_gt_info.json"))  # gt_bboxes
                     for img_id_str in tqdm(scene_gt_pose_dict, postfix=f"{scene_id}"):  # image
                         img_id_int = int(img_id_str)
-                        color_type = "gray" if dataset_name == 'itodd' or dataset_name == 'usprobe' else "rgb"
+                        color_type = self.color_type
                         rgb_path = os.path.join(scene_dir, "{}/{:06d}.jpg").format(color_type, img_id_int)
                         if not os.path.exists(rgb_path):
                             rgb_path = os.path.join(scene_dir, "{}/{:06d}.png").format(color_type, img_id_int)
@@ -304,43 +250,138 @@ class BOP_Dataset(torch.utils.data.Dataset):
                     print(img_type, ', images: ', image_counter, ', instances: ', instance_counter)
 
                 mmcv.dump(self.dataset_dicts, cache_path, protocol=5)
-                mmcv.dump(self.symmetries_dict, symmetries_cache_path, protocol=5)
-                mmcv.dump(self.cad_model_dict, cad_cache_path, protocol=5)
                 logger.info("Dumped dataset_dicts to {}".format(cache_path))
-                logger.info("Dumped symm_dicts to {}".format(symmetries_cache_path))
-                logger.info("Dumped cad_model_dicts to {}".format(cad_cache_path))
 
         self.dataset_dicts = misc.flat_dataset_dicts(self.dataset_dicts) # flatten the image-level dict to instance-level dict
 
-    def load_model_data(self, model_folder, sub_dataset_folder):
-        self.symmetries_dict[sub_dataset_folder] = dict()
-        with open(os.path.join(model_folder, 'models_info.json'), 'r') as fp:
-            model_info = json.load(fp)
-        for obj_id, info in model_info.items():
-            rotations_sym, translations_sym = utils.get_symmetry_transformations(info, 0.01)
-            model_path = os.path.join(model_folder, 'obj_{:06d}.ply'.format(int(obj_id)))
-            mesh = trimesh.load(model_path)
-            vertices = torch.from_numpy(
-                mesh.vertices.copy()).to(torch.float32)
-            faces = torch.from_numpy(
-                mesh.faces.copy()).to(torch.float32)
-            normals = torch.from_numpy(
-                mesh.vertex_normals.copy()).to(torch.float32)
-            alpha = torch.mean(torch.sum(vertices**2, dim=1))
-            mu = torch.mean(vertices, dim=0)
-            sigma = vertices.T @ vertices / len(vertices)
-            diameter = np.array(info['diameter'], dtype=np.float32)
-            self.cad_model_dict[model_path] = {
-                'vertices': vertices,
-                'faces': faces,
-                'normals': normals,
-                'diameter': diameter,
-                'alpha': alpha,
-                'mean': mu,
-                'correlation': sigma}
-            self.symmetries_dict[sub_dataset_folder][obj_id] = {
-                'rotation': rotations_sym,
-                'translation': translations_sym}
+        self.quat_label_path = self._quat_label_cache_path()
+        if not os.path.exists(self.quat_label_path):
+            labels = self._generate_quat_labels()
+            self._verify_quat_labels(labels)
+            np.save(self.quat_label_path, labels.astype(np.float16))
+            logger.info("Saved quaternion labels to {}".format(
+                self.quat_label_path))
+
+    def _instance_fingerprint(self):
+        """sha256 over the ordered (obj_id, R, t) of every instance."""
+        h = hashlib.sha256()
+        for inst in self.dataset_dicts:
+            info = inst['inst_infos']
+            h.update(str(int(info['obj_id'])).encode('utf-8'))
+            h.update(np.ascontiguousarray(
+                info['rotation'], dtype=np.float32).tobytes())
+            h.update(np.ascontiguousarray(
+                info['translation'], dtype=np.float32).tobytes())
+        return h.hexdigest()
+
+    def _quat_label_cache_path(self):
+        digest = hashlib.sha256("_".join([
+            SCHEMA_VERSION,
+            str(cfg.N_POSE_BIN),
+            str(cfg.POSE_SIGMA),
+            "proto{}".format(utils.PROTOTYPE_VERSION),
+            str(SYMMETRY_EPS),
+            str(len(self.dataset_dicts)),
+            self._instance_fingerprint(),
+        ]).encode('utf-8')).hexdigest()
+        return os.path.join(self.cache_dir, "quatbin_{}_{}_{}.npy".format(
+            self.dataset_name, "_".join(self.name_set), digest))
+
+    def _quat_label_chunk(self, registry, cls):
+        num_v = int(registry.num_vertices[cls])
+        num_s = max(int(registry.symmetries_mask[cls].sum().item()), 1)
+        per_sample = cfg.N_POSE_BIN * (num_v * 3 + num_s * 13) * 4
+        chunk = int(QUAT_LABEL_MEM_BUDGET // max(per_sample, 1))
+        return max(1, min(QUAT_LABEL_CHUNK_MAX, chunk))
+
+    def _quantize_quat_batched(self, registry, cls, quaternions, device):
+        num_v = int(registry.num_vertices[cls])
+        verts = registry.vertices[cls][:num_v]
+        vmask = registry.vertices_mask[cls][:num_v]
+        diam = registry.diameter[cls]
+        vcorr = registry.vertices_correlation[cls]
+        qsym = registry.quaternion_symmetries[cls]
+        tsym = registry.translation_symmetries[cls]
+        smask = registry.symmetries_mask[cls]
+
+        chunk = self._quat_label_chunk(registry, cls)
+        categories = []
+        for start in range(0, len(quaternions), chunk):
+            quat = quaternions[start:start + chunk].to(device)
+            n = len(quat)
+            cat = utils.quantize_quaternion_vertex(
+                quat,
+                verts[None].expand(n, -1, -1).contiguous().to(device),
+                vmask[None].expand(n, -1).contiguous().to(device),
+                diam[None].expand(n).contiguous().to(device),
+                vcorr[None].expand(n, -1, -1).contiguous().to(device),
+                qsym[None].expand(n, -1, -1).contiguous().to(device),
+                tsym[None].expand(n, -1, -1).contiguous().to(device),
+                smask[None].expand(n, -1).contiguous().to(device))[0]
+            categories.append(cat.detach().cpu().numpy())
+        return np.concatenate(categories, axis=0)
+
+    def _generate_quat_labels(self):
+        """Compute (N_inst, 4, N_POSE_BIN) labels on GPU, grouped by object."""
+        n_inst = len(self.dataset_dicts)
+        n_bins = cfg.N_POSE_BIN
+        out = np.empty((n_inst, 4, n_bins), dtype=np.float32)
+        registry = ObjectRegistry(self.dataset_name)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        by_cls = {}
+        for i, inst in enumerate(self.dataset_dicts):
+            cls = self.dataset_id2cls[inst['inst_infos']['obj_id']]
+            by_cls.setdefault(cls, []).append(i)
+
+        for cls, idxs in tqdm(by_cls.items(), desc='quat labels'):
+            rotations = np.stack([
+                np.asarray(self.dataset_dicts[i]['inst_infos']['rotation'],
+                           dtype=np.float32).reshape(3, 3) for i in idxs])
+            rz = np.stack([[[np.cos(r * np.pi / 2), -np.sin(r * np.pi / 2), 0.],
+                            [np.sin(r * np.pi / 2), np.cos(r * np.pi / 2), 0.],
+                            [0., 0., 1.]] for r in range(4)])
+            rz = rz.astype(np.float32)
+            composed = np.einsum('rij,njk->nrik', rz, rotations)
+            quats = utils.rotation_to_quaternion(
+                torch.from_numpy(composed.reshape(-1, 3, 3)))
+            labels = self._quantize_quat_batched(
+                registry, cls, quats, device)
+            out[idxs] = labels.reshape(len(idxs), 4, n_bins)
+        return out
+
+    def _verify_quat_labels(self, labels):
+        """Equivalence gate against the legacy ``quat_label/*.npy`` sidecars."""
+        legacy = [i for i in range(len(self.dataset_dicts))
+                  if os.path.exists(
+                      self.dataset_dicts[i]['inst_infos']['quat_file'])]
+        if len(legacy) == 0:
+            logger.warning(
+                "No legacy quat_label/*.npy found; skipping equivalence gate.")
+            return
+        rng = np.random.RandomState(cfg.RANDOM_SEED)
+        sample = rng.choice(
+            legacy, size=min(QUAT_LABEL_GATE_INSTANCES, len(legacy)),
+            replace=False)
+        worst = 0.0
+        bad = 0
+        for i in sample:
+            old = np.load(
+                self.dataset_dicts[i]['inst_infos']['quat_file']).astype(
+                    np.float64)
+            new = labels[i].astype(np.float64)
+            diff = float(np.abs(new - old).max())
+            worst = max(worst, diff)
+            if not np.allclose(new, old, rtol=1e-5, atol=1e-6):
+                bad += 1
+        logger.info(
+            "quat label equivalence: max_abs_diff=%.3e over %d instances",
+            worst, len(sample))
+        if bad > 0:
+            raise AssertionError(
+                "quat label equivalence gate failed for {}/{} instances "
+                "(max_abs_diff={:.3e})".format(
+                    bad, len(sample), worst))
 
     def get_info(self):
         return {
@@ -357,20 +398,16 @@ class BOP_Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         data_dict = self.dataset_dicts[idx]
-        batch = self.read_data(data_dict)
+        batch = self.read_data(data_dict, idx)
         return batch
 
-    def read_data(self, dataset_dict):
-        dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-        inst_infos = dataset_dict.pop("inst_infos")
+    def read_data(self, dataset_dict, idx):
+        inst_infos = dataset_dict['inst_infos']
         obj_id = inst_infos['obj_id']
         scene_id = inst_infos['scene_id']
         image_id = inst_infos['im_id']
 
         image_file = inst_infos["image_file"]
-        img_type = dataset_dict['img_type']
-        model_folder = os.path.join(self.data_dir, self.model_folders[img_type])
-        model = self.cad_model_dict[inst_infos['model_file']]
 
         image = mmcv.imread(image_file, 'color', self.img_format)
         image = image.astype(np.float32)
@@ -409,7 +446,7 @@ class BOP_Dataset(torch.utils.data.Dataset):
             wr = (x2 - x1) / bbox_scale
             bbox_loc = np.array([0.5 - wr/2, 0.5 - hr/2, 0.5 + wr/2, 0.5 + hr/2])
 
-        obj_inst_count = dataset_dict.pop('obj_inst_count')
+        obj_inst_count = dataset_dict['obj_inst_count']
         rot_index = 0
         if self.split == 'train': #### randomly replace the background if an image contains multiple instances of the same object ####
             if obj_inst_count[obj_id] > 2 and np.random.rand() < self.CHANGE_BG_PROB:
@@ -442,11 +479,9 @@ class BOP_Dataset(torch.utils.data.Dataset):
 
         fx, fy, cx, cy = cam_K[0, 0], cam_K[1, 1], cam_K[0, 2], cam_K[1, 2]
         fov = np.array([(bbox_center[0] - cx) / fx, (bbox_center[1] - cy) / fy, bbox_scale / fx])
-        dataset_dict["fov"] = torch.as_tensor(fov, dtype=torch.float32)
 
         T_img2roi = misc.transform_to_local_ROIcrop(bbox_center=bbox_center, bbox_scale=bbox_scale, zoom_scale=self.rgb_size)
         roi_camK = T_img2roi.numpy() @ cam_K
-        roi_PEmap = misc.generate_PEmap(im_hei=self.rgb_size, im_wid=self.rgb_size, cam_K=roi_camK) # 2xHxW
 
         Tz = np.array([[1.0, 0.0, -0.5],
                        [0.0, 1.0, -0.5],
@@ -455,82 +490,23 @@ class BOP_Dataset(torch.utils.data.Dataset):
         bbox_loc = utils.transform_bounding_box(bbox_loc, T_loc)
         bbox_map = utils.make_roi(torch.as_tensor(bbox_loc, dtype=torch.float32), self.rgb_size).unsqueeze(0)
 
-        dataset_dict["roi_camK"] = torch.as_tensor(roi_camK, dtype=torch.float32).squeeze()      # 3x3
-        dataset_dict["T_img2roi"] = torch.as_tensor(T_img2roi, dtype=torch.float32).squeeze()    # 3x3
-        dataset_dict["roi_image"] = torch.as_tensor(roi_img, dtype=torch.float32).contiguous()   # 3xHxW
-        dataset_dict["roi_mask"] = torch.as_tensor(roi_mask, dtype=torch.float32).contiguous()   # H/4xW/4 
-        dataset_dict["roi_PEmap"] = torch.as_tensor(roi_PEmap, dtype=torch.float32).contiguous() # 2xHxW
-        dataset_dict["obj_cls"] = torch.as_tensor(self.dataset_id2cls[obj_id], dtype=torch.int64)
+        quat_bin = np.load(self.quat_label_path, mmap_mode='r')
 
-        dataset_dict["roi_obj_t"] = torch.as_tensor(obj_t, dtype=torch.float32)          # object GT 3D location
-        dataset_dict["roi_obj_R"] = torch.as_tensor(obj_R, dtype=torch.float32)          # object GT egocentric 3D orientation
-        dataset_dict["bbox_scale"] = torch.as_tensor(bbox_scale, dtype=torch.float32)    # object (padded) bbox scale
-        dataset_dict["bbox_center"] = torch.as_tensor(bbox_center, dtype=torch.float32)  # object bbox center
-        dataset_dict["bbox_loc"] = torch.as_tensor(bbox_loc, dtype=torch.float32)  # relative bbox coordinates [0, 1] inside roi
-        dataset_dict["bbox_map"] = torch.as_tensor(bbox_map, dtype=torch.float32)  # binary mask indicating the bounding box areas
-
-        ######### CAD model ############################
-        obj_symmetries = self.symmetries_dict[inst_infos['sub_dataset_folder']][str(inst_infos['obj_id'])]
-        quat_symmetries = utils.rotation_to_quaternion(torch.from_numpy(obj_symmetries['rotation']).to(torch.float32))
-        trans_symmetries = torch.from_numpy(obj_symmetries['translation']).to(torch.float32)
-        assert len(quat_symmetries) == len(trans_symmetries)
-        dataset_dict['vertices'] = model['vertices']
-        dataset_dict['normals'] = model['normals']
-        dataset_dict['vertices_norm'] = model['alpha']
-        dataset_dict['vertices_mean'] = model['mean']
-        dataset_dict['vertices_correlation'] = model['correlation']
-        dataset_dict['diameter'] = torch.as_tensor(model['diameter'], dtype=torch.float32)
-        dataset_dict['quaternion_symmetries'] = quat_symmetries
-        dataset_dict['translation_symmetries'] = trans_symmetries
-        dataset_dict['obj_id'] = obj_id
-        dataset_dict['scene_id'] = scene_id
-        dataset_dict['image_id'] = image_id
-
-        ######### Quaternion conversion  ###############
-        rot_ego = torch.reshape(dataset_dict["roi_obj_R"], (1, 3, 3))
-        quat_ego = utils.rotation_to_quaternion(rot_ego)[0]
-        dataset_dict['quat_ego'] = quat_ego
-        quat_bin = np.load(inst_infos["quat_file"])
-        dataset_dict['quat_bin'] = torch.as_tensor(quat_bin[rot_index], dtype=torch.float32)
-
-        roi_delta_pxpy, roi_delta_tz = misc.convert_TxTyTz_to_delta_PxPyTz(T3=obj_t, camK=cam_K, bbox_center=bbox_center,
-                                                                           bbox_scale=bbox_scale, zoom_scale=self.rgb_size)
-
-        dataset_dict["roi_delta_tz"] = roi_delta_tz  # scale-invariant z-axis translation
-        dataset_dict["roi_delta_pxpy"] = torch.as_tensor(roi_delta_pxpy, dtype=torch.float32)    # object GT scale-invariant projection shift delta_pxpy
-
-        if self.Rz_rotation_aug: # rotation augmentation
-            Rz_index = torch.randperm(4)[0] # 0:0˚, 1:90˚, 2:180˚, 3:270˚
-            Rz_rad = torch.tensor([0.0, 0.0, math.pi * Rz_index * 0.5]) # 0˚, 90˚, 180˚, 270˚
-            Rz_mat = euler_angles_to_matrix(Rz_rad, 'XYZ').type(torch.float32)
-
-            roi_img = dataset_dict["roi_image"].clone()
-            roi_mask = dataset_dict["roi_mask"].clone()
-
-            ##### rotate the corresponding RGB, Mask, rotation, object projection
-            if Rz_index == 1:
-                roi_img = torch.flip(roi_img, [-2]).transpose(-1, -2)   # 90 deg
-                roi_mask = torch.flip(roi_mask, [-2]).transpose(-1, -2) # 90 deg
-            elif Rz_index == 2:
-                roi_img = torch.flip(roi_img, [-1, -2])                 # 180 deg
-                roi_mask = torch.flip(roi_mask, [-1, -2])               # 180 deg
-            elif Rz_index == 3:
-                roi_img = torch.flip(roi_img, [-1]).transpose(-1, -2)   # 270 deg
-                roi_mask = torch.flip(roi_mask, [-1]).transpose(-1, -2) # 270 deg
-
-            dataset_dict["roi_image"] = roi_img
-            dataset_dict["roi_mask"] = roi_mask
-
-            # calculate the object pose after in-plane rotation
-            dataset_dict["roi_obj_R"] = Rz_mat @ dataset_dict["roi_obj_R"]
-            dataset_dict["roi_delta_pxpy"] = Rz_mat[:2, :2] @ dataset_dict["roi_delta_pxpy"]
-
-            # calculate the object location after in-plane rotation
-            roi_obj_camK = dataset_dict["roi_camK"]
-            roi_homo_proj = F.pad(dataset_dict["roi_delta_pxpy"] * self.rgb_size, pad=[0, 1], value=1.0)  # [s_zoom * delta_x, s_zoom * delta_y, 1.0]
-            dataset_dict["roi_obj_t"] = self.rgb_size / bbox_scale * roi_delta_tz * torch.inverse(roi_obj_camK) @ roi_homo_proj  # r * delta_z * inv(K_B) @ P_B
-
-        return dataset_dict
+        return {
+            'roi_image': torch.as_tensor(roi_img, dtype=torch.float32).contiguous(),
+            'bbox_map': torch.as_tensor(bbox_map, dtype=torch.float32),
+            'roi_camK': torch.as_tensor(roi_camK, dtype=torch.float32).squeeze(),
+            'fov': torch.as_tensor(fov, dtype=torch.float32),
+            'obj_cls': torch.as_tensor(self.dataset_id2cls[obj_id], dtype=torch.int64),
+            'roi_obj_R': torch.as_tensor(obj_R, dtype=torch.float32),
+            'roi_obj_t': torch.as_tensor(obj_t, dtype=torch.float32),
+            'roi_mask': torch.as_tensor(roi_mask, dtype=torch.float32).contiguous(),
+            'quat_bin': torch.as_tensor(
+                np.array(quat_bin[idx][rot_index], dtype=np.float32)),
+            'obj_id': int(obj_id),
+            'scene_id': int(scene_id),
+            'image_id': int(image_id),
+        }
 
     @misc.lazy_property
     def _bg_img_paths(self):

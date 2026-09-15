@@ -1,9 +1,10 @@
+from dataclasses import dataclass
+
 INPUT_SIZE = 256
 CELL_SIZE = 64
 MASK_SIZE = 64
 USE_6D = True
 N_POSE_BIN = 4608  # number of bins for 3D orientation
-N_BIN_TO_KEEP = 9
 
 WEIGHT_TRANS_CLF = 2.0
 WEIGHT_DEPTH_CLF = 2.0  # 1.0 for hard labels
@@ -47,6 +48,7 @@ DATASET_CONFIG = {
     'tless': {
         'width': 720,
         'height': 540,
+        'color_type': 'rgb',
         'Tz_near': 0.050,
         'Tz_far': 1.700,
         'num_class': 30,
@@ -63,6 +65,7 @@ DATASET_CONFIG = {
     'itodd': {
         'width': 1280,
         'height': 960,
+        'color_type': 'gray',
         'Tz_near': 0.01,
         'Tz_far': 1.85,
         'num_class': 28,
@@ -78,6 +81,7 @@ DATASET_CONFIG = {
     'ycbv': {
         'width': 640,
         'height': 480,
+        'color_type': 'rgb',
         'Tz_near': 0.030,
         'Tz_far': 2.000,
         'num_class': 21,
@@ -95,6 +99,7 @@ DATASET_CONFIG = {
     'lmo': {
         'width': 640,
         'height': 480,
+        'color_type': 'rgb',
         'Tz_near': 0.010,
         'Tz_far': 2.150,
         'num_class': 15,
@@ -112,6 +117,8 @@ DATASET_CONFIG = {
     'ycbv-ds': {
         'width': 640,
         'height': 480,
+        'color_type': 'rgb',
+        'bop_dataset': 'ycbv',
         'Tz_near': 0.030,
         'Tz_far': 2.000,
         'num_class': 21,
@@ -127,6 +134,7 @@ DATASET_CONFIG = {
     'usprobe': {
         'width': 1280,
         'height': 720,
+        'color_type': 'gray',
         'Tz_near': 0.010,
         'Tz_far': 2.000,
         'num_class': 4,
@@ -141,3 +149,28 @@ DATASET_CONFIG = {
         'test_set': ['test'],
     }
 }
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Model-shape hyperparameters, saved inside checkpoints so inference can
+    rebuild the network without deriving globals from the dataset name."""
+    dataset: str
+    n_decoders: int
+    depth_min: float
+    depth_max: float
+    n_depth_bin: int
+    n_pose_bin: int = N_POSE_BIN
+    use_6d: bool = USE_6D
+    cell_size: int = CELL_SIZE
+    input_img_size: int = INPUT_IMG_SIZE
+
+    @classmethod
+    def from_dataset_config(cls, dataset):
+        dataset_cfg = DATASET_CONFIG[dataset]
+        return cls(
+            dataset=dataset,
+            n_decoders=dataset_cfg['num_class'],
+            depth_min=dataset_cfg['Tz_near'],
+            depth_max=dataset_cfg['Tz_far'],
+            n_depth_bin=Tz_BINS_NUM)

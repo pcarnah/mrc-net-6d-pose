@@ -82,24 +82,22 @@ if __name__ == '__main__':
     }
     dataset_id2cls = bop_cfg.DATASET_CONFIG[p['dataset']]['id2cls']
 
-    model_type = 'eval'
-    dp_model = dataset_params.get_model_params(
-        p['bop_root'], 'ycbv', model_type)
+    params_dataset = bop_cfg.DATASET_CONFIG[p['dataset']].get(
+        'bop_dataset', p['dataset'])
     dp_data = dataset_params.get_split_params(
-        p['bop_root'],'ycbv', 'test')
-    with open(dp_model['models_info_path'], 'r') as fp:
-        model_info = json.load(fp)
+        p['bop_root'], params_dataset, 'test')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    depth_min = bop_cfg.DATASET_CONFIG[p['dataset']]['Tz_near']
-    depth_max = bop_cfg.DATASET_CONFIG[p['dataset']]['Tz_far']
-    n_decoders = len(dataset_id2cls)
-    net = models.MRCNet(
-        p['dataset'], depth_min=depth_min,
-        depth_max=depth_max, n_decoders=n_decoders,
-        n_depth_bin=bop_cfg.Tz_BINS_NUM).to(device)
-    print('building model for {}'.format(p['dataset']))
     checkpoint = torch.load(p['checkpoint'], map_location=device)
+    if 'model_config' in checkpoint:
+        model_config = bop_cfg.ModelConfig(**checkpoint['model_config'])
+        if model_config.dataset != p['dataset']:
+            print('WARNING: checkpoint dataset {} != CLI dataset {}'.format(
+                model_config.dataset, p['dataset']))
+    else:
+        model_config = bop_cfg.ModelConfig.from_dataset_config(p['dataset'])
+    net = models.MRCNet(model_config).to(device)
+    print('building model for {}'.format(p['dataset']))
     print('loading pre-trained model from {}'.format(p['checkpoint']))
     net.load_state_dict(checkpoint['network'])
     net.eval()
@@ -201,7 +199,6 @@ if __name__ == '__main__':
             inst_score = det_scores[inst_ix]
             mask_visib = None
             inst_cls = inst_id
-            diameter = model_info[str(inst_id)]['diameter']
 
             x1, y1, x2, y2 = det_bboxes[inst_ix]
             cx = min((x1 + x2) / 2.0, img_W)
