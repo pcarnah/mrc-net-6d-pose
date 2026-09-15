@@ -161,6 +161,8 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+AGENTS.md
+
 slurm*.out
 runs*/
 *.pth
@@ -175,10 +177,11 @@ output*/
 .kornia_hub/
 .virtual_documents/
 .kilo/
+.vscode/
 
 package-lock.json
 
 *.png
 *.svg
 *.pdf
-*.zip
+*.zip*
