@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torchvision import models as model_zoo
 import config as cfg
 from functools import partial
-from spatial_correlation_sampler import SpatialCorrelationSampler
+from correlation import SpatialCorrelationSampler
 from object_registry import ObjectRegistry
 import rendering
 

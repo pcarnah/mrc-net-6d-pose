@@ -11,8 +11,8 @@ import torch
 import argparse
 import numpy as np
 from bop_toolkit_lib import inout
-import mmcv
 import pycocotools.mask as cocomask
+from lib import file_io
 root_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(root_dir)
 
@@ -165,7 +165,7 @@ if __name__ == '__main__':
         scene_id = int(scene_id_str)
 
         scene_dir = '{}/{:06d}'.format(dp_data['split_path'], scene_id)
-        scene_camK = mmcv.load(os.path.join(scene_dir, 'scene_camera.json'))
+        scene_camK = file_io.load(os.path.join(scene_dir, 'scene_camera.json'))
         view_rgb_file = os.path.join(
             scene_dir, 'rgb', '{:06d}.png'.format(view_id))
         if not os.path.exists(view_rgb_file):
@@ -176,7 +176,7 @@ if __name__ == '__main__':
         view_cam_K = np.asarray(
             scene_camK[str(view_id)]['cam_K'],
             dtype=np.float32).reshape((3, 3))
-        view_image = torch.as_tensor(mmcv.imread(
+        view_image = torch.as_tensor(file_io.imread(
             view_rgb_file, 'color', 'BGR'), dtype=torch.float32)
         img_H, img_W = view_image.shape[:2]
 

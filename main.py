@@ -33,6 +33,10 @@ def main_worker(rank, world_size, args):
     torch.manual_seed(bop_cfg.RANDOM_SEED)
     torch.backends.cudnn.benchmark = True
 
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    cv2.setNumThreads(0)
+
     if args.is_parallel:
         world_rank = int(os.environ['RANK']) if 'RANK' in os.environ else rank
         print('Running DDP on rank {:d}.'.format(world_rank))

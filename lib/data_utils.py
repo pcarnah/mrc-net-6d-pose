@@ -10,7 +10,8 @@ from pytorch3d import io as pyt3d_io
 from pytorch3d import structures as pyt3d_struct
 from pytorch3d import renderer as pyt3d_renderer
 from pytorch3d.transforms import euler_angles_to_matrix
-import kornia
+from kornia.image import image_to_tensor
+from kornia.geometry.transform import warp_affine
 
 def get_dir(src_point, rot_rad):
     sn, cs = np.sin(rot_rad), np.cos(rot_rad)
@@ -68,12 +69,12 @@ def get_affine_transform(center, scale, rot, output_size, shift=np.array([0, 0],
 
     return trans
 
-def image_to_tensor(img):
-    if len(img.shape) == 2:
-        img = np.unsqueeze(img, -1)
-    img = img.transpose(2, 0, 1)
-    img_tensor = torch.from_numpy(img)
-    return img_tensor
+# def image_to_tensor(img):
+#     if len(img.shape) == 2:
+#         img = np.unsqueeze(img, -1)
+#     img = img.transpose(2, 0, 1)
+#     img_tensor = torch.from_numpy(img)
+#     return img_tensor
 
 def get_affine_matrix(center, scale, rot, output_size, camK):
     Rz = torch.tensor([[np.cos(rot), -np.sin(rot), 0.0],
@@ -102,10 +103,10 @@ def crop_resize_by_warp_affine(img, center, scale, output_size, camK, rot=0, int
         cv2_flag = cv2.INTER_NEAREST if interpolation=='nearest' else cv2.INTER_LINEAR
         dst_img_cv2 = cv2.warpAffine(img, trans, (int(output_size[0]), int(output_size[1])), flags=cv2_flag)
         cv2.imwrite('temp_img_cv2.png', dst_img_cv2)
-    img = kornia.utils.image_to_tensor(img.copy()).unsqueeze(0).float()
+    img = image_to_tensor(img.copy()).unsqueeze(0).float()
     # img = image_to_tensor(img).unsqueeze(0).float()
     trans = trans[None].to(torch.float32)
-    dst_img = kornia.geometry.transform.warp_affine(img, trans, dsize=(int(output_size[0]), int(output_size[1])), mode=interpolation)
+    dst_img = warp_affine(img, trans, dsize=(int(output_size[0]), int(output_size[1])), mode=interpolation)
     dst_img = dst_img.squeeze(0)
     if debug:
         cv2.imwrite('temp_img_kornia.png', dst_img)

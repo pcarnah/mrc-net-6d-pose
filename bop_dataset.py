@@ -1,7 +1,7 @@
 import os
 import sys
+from pathlib import Path
 import cv2
-import mmcv
 import torch
 import random
 import hashlib
@@ -31,43 +31,8 @@ QUAT_LABEL_CHUNK_MAX = 16
 QUAT_LABEL_GATE_INSTANCES = 200
 
 from lib import data_utils as misc
-
-from imgaug.augmenters.arithmetic import multiply_elementwise
-from imgaug.augmenters import (Sequential, SomeOf, OneOf, Sometimes, WithColorspace, WithChannels, Noop,
-                               Lambda, AssertLambda, AssertShape, Scale, CropAndPad, Pad, Crop, Fliplr,
-                               Flipud, Superpixels, ChangeColorspace, PerspectiveTransform, Grayscale,
-                               GaussianBlur, AverageBlur, MedianBlur, Convolve, Sharpen, Emboss, EdgeDetect,
-                               DirectedEdgeDetect, Add, AddElementwise, AdditiveGaussianNoise, Multiply,
-                               MultiplyElementwise, Dropout, CoarseDropout, Invert, ContrastNormalization,
-                               Affine, PiecewiseAffine, ElasticTransformation, pillike, LinearContrast)
-
-
-class DropoutWithMask(CoarseDropout):
-    def _augment_batch_(self, batch, random_state, parents, hooks):
-        if batch.images is None:
-            return batch
-
-        images = batch.images
-        segmentation_maps = batch.segmentation_maps
-        nb_images = len(images)
-        rss = random_state.duplicate(1+nb_images)
-        per_channel_samples = self.per_channel.draw_samples(
-            (nb_images,), random_state=rss[0])
-
-        gen = enumerate(zip(images, per_channel_samples, rss[1:], segmentation_maps))
-        for i, (image, per_channel_samples_i, rs, seg_map) in gen:
-            height, width, nb_channels = image.shape
-            sample_shape = (height,
-                            width,
-                            nb_channels if per_channel_samples_i > 0.5 else 1)
-            mul = self.mul.draw_samples(sample_shape, random_state=rs)
-            mul = mul.astype(bool, copy=False)
-
-            batch.images[i] = multiply_elementwise(image, mul)
-            batch.segmentation_maps[i].arr = multiply_elementwise(
-                seg_map.arr.astype(np.uint8), mul)
-
-        return batch
+from lib import file_io
+from torchvision.transforms import v2
 
 
 class BOP_Dataset(PoseDataset):
@@ -101,16 +66,18 @@ class BOP_Dataset(PoseDataset):
         self.mask_morph = True
         self.filter_invalid = True
         self.mask_morph_kernel_size = 3
-        self.color_augmentor = Sequential([
-            Sometimes(0.5, AdditiveGaussianNoise(scale=(0, 0.01*255), per_channel=0.5)),
-            Sometimes(0.5, DropoutWithMask(p=0.2, size_percent=0.05)),
-            Sometimes(0.5, GaussianBlur(1.2*np.random.rand())),
-            Sometimes(0.5, Add((-25, 25), per_channel=0.3)),
-            Sometimes(0.3, Invert(0.2, min_value=0, max_value=255, per_channel=True)),
-            Sometimes(0.5, Multiply((0.6, 1.4), per_channel=0.5)),
-            Sometimes(0.5, Multiply((0.6, 1.4))),
-            Sometimes(0.5, LinearContrast((0.5, 2.2), per_channel=0.3))
-        ], random_order=False)  # aae
+        # Photometric augmentation, applied to the crop together with its mask.
+        # The image is fed as a float tensor in [0, 1]; the mask is passed
+        # through untouched by the colour transforms and only erased alongside
+        # the dropped-out regions.
+        self.color_augmentor = v2.Compose([
+            v2.RandomApply([v2.GaussianNoise(sigma=0.01)], p=0.5),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 1.2))], p=0.5),
+            v2.RandomApply([v2.ColorJitter(brightness=0.1, contrast=0.5,
+                                           saturation=0.5, hue=0.05)], p=0.5),
+            v2.RandomInvert(p=0.15),
+            v2.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.5, 2.0), value=0.0),
+        ])
 
         self.DZI_PAD_SCALE = cfg.ZOOM_PAD_SCALE
         self.DZI_SCALE_RATIO = cfg.ZOOM_SCALE_RATIO  # wh scale
@@ -140,7 +107,7 @@ class BOP_Dataset(PoseDataset):
         self.dataset_dicts = list()
         if self.use_cache and os.path.exists(cache_path):
             # print("load cached dataset dicts from {}".format(cache_path))
-            self.dataset_dicts = mmcv.load(cache_path)
+            self.dataset_dicts = file_io.load(cache_path)
             # print('done')
         else:
             for img_type in self.name_set:
@@ -156,9 +123,9 @@ class BOP_Dataset(PoseDataset):
                         continue
                     scene_id = int(scene)
                     scene_dir = os.path.join(train_dir, scene)
-                    scene_cam_dict = mmcv.load(os.path.join(scene_dir, "scene_camera.json"))      # gt_intrinsic
-                    scene_gt_pose_dict = mmcv.load(os.path.join(scene_dir, "scene_gt.json"))      # gt_poses
-                    scene_gt_bbox_dict = mmcv.load(os.path.join(scene_dir, "scene_gt_info.json"))  # gt_bboxes
+                    scene_cam_dict = file_io.load(os.path.join(scene_dir, "scene_camera.json"))      # gt_intrinsic
+                    scene_gt_pose_dict = file_io.load(os.path.join(scene_dir, "scene_gt.json"))      # gt_poses
+                    scene_gt_bbox_dict = file_io.load(os.path.join(scene_dir, "scene_gt_info.json"))  # gt_bboxes
                     for img_id_str in tqdm(scene_gt_pose_dict, postfix=f"{scene_id}"):  # image
                         img_id_int = int(img_id_str)
                         color_type = self.color_type
@@ -207,7 +174,7 @@ class BOP_Dataset(PoseDataset):
                                 continue
 
                             if cfg.CACHE_MASK:
-                                mask_single = mmcv.imread(mask_visib_file, "unchanged").astype(bool).astype(np.uint8)
+                                mask_single = file_io.imread(mask_visib_file, "unchanged").astype(bool).astype(np.uint8)
                                 if self.mask_morph:
                                     kernel = np.ones((self.mask_morph_kernel_size, self.mask_morph_kernel_size))
                                     mask_single = cv2.morphologyEx(mask_single.astype(np.uint8), cv2.MORPH_CLOSE, kernel)  # remove holes
@@ -249,7 +216,7 @@ class BOP_Dataset(PoseDataset):
 
                     print(img_type, ', images: ', image_counter, ', instances: ', instance_counter)
 
-                mmcv.dump(self.dataset_dicts, cache_path, protocol=5)
+                file_io.dump(self.dataset_dicts, cache_path, protocol=5)
                 logger.info("Dumped dataset_dicts to {}".format(cache_path))
 
         self.dataset_dicts = misc.flat_dataset_dicts(self.dataset_dicts) # flatten the image-level dict to instance-level dict
@@ -409,18 +376,20 @@ class BOP_Dataset(PoseDataset):
 
         image_file = inst_infos["image_file"]
 
-        image = mmcv.imread(image_file, 'color', self.img_format)
+        image = file_io.imread(image_file, 'color', self.img_format)
         image = image.astype(np.float32)
         im_H, im_W = image.shape[:2]
         if cfg.CACHE_MASK:
             mask = misc.cocosegm2mask(inst_infos["mask_file"], im_H, im_W)
         else:
-            mask = mmcv.imread(inst_infos["mask_file"], "unchanged").astype(bool).astype(np.uint8)
+            mask = file_io.imread(inst_infos["mask_file"], "unchanged").astype(bool).astype(np.uint8)
         ### RGB augmentation ###
         if (self.split == 'train' or self.split == 'finetune') and np.random.rand() < self.COLOR_AUG_PROB:
-            image, mask = self.color_augmentor.augment(
-                image=image, segmentation_maps=mask[None, :, :, None])
-            mask = mask[0, :, :, 0]
+            image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+            mask_t = torch.from_numpy(mask).unsqueeze(0).float()
+            augmented = self.color_augmentor({'image': image_t, 'mask': mask_t})
+            image = (augmented['image'] * 255.0).permute(1, 2, 0).numpy().astype(np.float32)
+            mask = augmented['mask'][0].numpy().astype(np.uint8)
 
         obj_R = inst_infos['rotation'].astype("float32").reshape(3, 3)
         obj_t = inst_infos['translation'].astype("float32").reshape(3,)
@@ -519,10 +488,10 @@ class BOP_Dataset(PoseDataset):
             ("{}_{}_{}_get_bg_imgs".format(bg_root, bg_num, bg_type)).encode("utf-8")
         ).hexdigest()
         cache_path = osp.join(".cache/bg_paths_{}_{}.pkl".format(bg_type, hashed_file_name))
-        mmcv.mkdir_or_exist(osp.dirname(cache_path))
+        Path(osp.dirname(cache_path)).mkdir(parents=True, exist_ok=True)
         if osp.exists(cache_path):
             logger.info("get bg_paths from cache file: {}".format(cache_path))
-            bg_img_paths = mmcv.load(cache_path)
+            bg_img_paths = file_io.load(cache_path)
             logger.info("num bg imgs: {}".format(len(bg_img_paths)))
             assert len(bg_img_paths) > 0
             return bg_img_paths
@@ -562,14 +531,14 @@ class BOP_Dataset(PoseDataset):
         num_bg_imgs = min(len(img_paths), bg_num)
         bg_img_paths = np.random.choice(img_paths, num_bg_imgs)
 
-        mmcv.dump(bg_img_paths, cache_path)
+        file_io.dump(bg_img_paths, cache_path)
         logger.info("num bg imgs: {}".format(len(bg_img_paths)))
         assert len(bg_img_paths) > 0
         return bg_img_paths
 
     def trunc_mask(self, mask):
         # return the bool truncated mask
-        mask = mask.copy().astype(np.bool)
+        mask = mask.copy().astype(bool)
         nonzeros = np.nonzero(mask.astype(np.uint8))
         x1, y1 = np.min(nonzeros, axis=1)
         x2, y2 = np.max(nonzeros, axis=1)
@@ -646,7 +615,7 @@ class BOP_Dataset(PoseDataset):
         target_size = min(imH, imW)
         max_size = max(imH, imW)
         real_hw_ratio = float(imH) / float(imW)
-        bg_image = mmcv.imread(filename, 'color', self.img_format)
+        bg_image = file_io.imread(filename, 'color', self.img_format)
         bg_h, bg_w, bg_c = bg_image.shape
         bg_image_resize = np.zeros((imH, imW, channel), dtype="uint8")
         if (float(imH) / float(imW) < 1 and float(bg_h) / float(bg_w) < 1) or (
@@ -677,7 +646,7 @@ class BOP_Dataset(PoseDataset):
         return bg_image_resize
 
     def get_bg_image_v2(self, filename, imH, imW, channel=3):
-        _bg_img = mmcv.imread(filename, 'color', self.img_format)
+        _bg_img = file_io.imread(filename, 'color', self.img_format)
         try:
             # randomly crop a region as background
             bw = _bg_img.shape[1]

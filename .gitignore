@@ -185,3 +185,7 @@ package-lock.json
 *.svg
 *.pdf
 *.zip*
+
+# The project's own source package lives in ./lib; the template's ``lib/``
+# rule above (meant for in-tree virtualenvs) would otherwise hide new modules.
+!lib/

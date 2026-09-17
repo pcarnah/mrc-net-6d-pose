@@ -22,10 +22,10 @@ POSE_SIGMA = 0.03  # standard deviation of quaternion bin distribution
 DEPTH_SIGMA = 0.5     # standard deviation of depth Gaussian distribution
 TRANS_SIGMA = 10 / INPUT_SIZE  # standard deviation of noise in 2D center
 
-# DATASET_ROOT = "D:/6DPose"
-# EVAL_ROOT = "D:/6DPose"
-DATASET_ROOT = "/mnt/d/6DPose"
-EVAL_ROOT = "/mnt/d/6DPose"
+DATASET_ROOT = "D:/6DPose"
+EVAL_ROOT = "D:/6DPose"
+# DATASET_ROOT = "/mnt/d/6DPose"
+# EVAL_ROOT = "/mnt/d/6DPose"
 VOC_BG_ROOT = "./data/VOCdevkit/VOC2012"
 
 END_LR = 5e-6
