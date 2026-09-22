@@ -14,6 +14,13 @@ WEIGHT_QUAT_REG = 1.0
 WEIGHT_TRANS_REG = 1.0
 WEIGHT_DEPTH_REG = 0.2
 
+# Deep supervision of the iterative refinement loop (`MRCNet.forward`).
+# None -> every refinement iteration (including iteration 0) is weighted 1.0;
+# otherwise a list/tuple of per-iteration weights of length n_refine_iters.
+REFINE_ITER_WEIGHTS = None
+# Opt-in gradient checkpointing for the synthetic backbone+decoder branch.
+REFINE_GRAD_CKPT = False
+
 RANDOM_SEED = 2022      # random seed
 INPUT_IMG_SIZE = 256    # the input image size of network
 OUTPUT_MASK_SIZE = 64   # the output mask size of network

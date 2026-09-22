@@ -5,6 +5,7 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torchvision import models as model_zoo
 import config as cfg
 from functools import partial
@@ -406,12 +407,115 @@ class MRCNet(nn.Module):
                        'translation': trans_persp}
         return predictions
 
-    def forward(self, inputs, aux, targets=None):
+    def _refine_step(self, x_clf, R_cur, t_cur, aux, grad_ckpt=False):
+        """One synthetic-branch forward for the current pose estimate.
+
+        Renders ``(R_cur, t_cur)``, runs the weight-shared backbone and decoder
+        on the synthetic/real feature pair and predicts the residual to compose
+        on top of the current pose.  ``R_cur``/``t_cur`` are treated as a
+        detached base: only the residuals carry gradient within a step.
+        """
+        R_base = R_cur.detach()
+        t_base = t_cur.detach()
+
+        with torch.no_grad():
+            out = self.renderer.render(
+                aux['obj_cls'], R_base, t_base,
+                [rendering.CameraView(K=aux['intrinsics'])])
+            render = out['rgb'][:, 0]
+            render_map = out['bbox_map'][:, 0]
+
+        sync_inputs = torch.concat([render, render_map], dim=1)
+
+        def synt_forward(sync_inputs, x_clf_in):
+            x2, mask_synt = self.backbone(sync_inputs, aux['obj_cls'])
+            x_synt_in = torch.concat(
+                [x2, mask_synt.detach().sigmoid()], dim=1)
+            x_reg = self.decoder(x_clf_in, x_synt_in)
+            return x_reg, mask_synt
+
+        if grad_ckpt:
+            x_reg, mask_synt = torch.utils.checkpoint.checkpoint(
+                synt_forward, sync_inputs, x_clf, use_reentrant=False)
+        else:
+            x_reg, mask_synt = synt_forward(sync_inputs, x_clf)
+
+        x_reg['fov'] = torch.concat([
+            t_base[..., :2] / t_base[..., -1:],
+            aux['fov'][..., 2:]], dim=1)
+        pose_res, depth_res, trans_res = self.regressor(x_reg)
+        return {'render': render, 'render_map': render_map,
+                'mask_synt': mask_synt, 'pose_res': pose_res,
+                'depth_res': depth_res, 'trans_res': trans_res}
+
+    def _compose_refine(self, step, R_cur, t_cur, aux, mask_real):
+        """Compose one refinement residual onto the current pose estimate.
+
+        ``R_k = ortho6d(pose_res) @ R_cur`` and the translation residual is
+        added to the perspective coordinates / nearest depth bin of
+        ``t_cur``, mirroring how ``_make_predictions`` composes iteration 0's
+        residual onto the classification argmax.
+        """
+        image_size = (cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE)
+        R_base = R_cur.detach()
+        t_base = t_cur.detach()
+
+        if self.use_6d:
+            R_res = utils.compute_rotation_matrix_from_ortho6d(step['pose_res'])
+            rot_ego = R_res @ R_base
+        else:
+            quat_res = utils.multiply_quaternion(
+                step['pose_res'], utils.rotation_to_quaternion(R_base))
+            rot_ego = utils.quaternion_to_rotation(quat_res)
+
+        t_persp = utils.trans_3d_to_perspective(
+            t_base, image_size, aux['intrinsics'])
+        trans_2d_base = t_persp[..., :2]
+        depth_base = t_persp[..., -1:]
+        depth_id_base = utils.nearest_depth_bin(
+            depth_base.squeeze(-1), self.depth_min, self.depth_max,
+            self.n_depth_bin)
+        depth_bins = utils.make_depth_bins(
+            self.depth_min, self.depth_max, self.n_depth_bin,
+            device=depth_base.device)
+        depth_bins = torch.repeat_interleave(
+            depth_bins, len(depth_id_base), dim=0)
+        depth = torch.gather(
+            depth_bins, dim=-1, index=depth_id_base.unsqueeze(-1)) \
+            + step['depth_res']
+        trans_xy = trans_2d_base + step['trans_res']
+        translation = torch.concat([trans_xy, depth], dim=-1)
+
+        return {'roi_mask': mask_real,
+                'roi_mask_synt': step['mask_synt'],
+                'roi_obj_R': rot_ego,
+                'quat_res': step['pose_res'],
+                'depth_res': step['depth_res'],
+                'trans_xy': trans_xy,
+                'trans_res': step['trans_res'],
+                'translation': translation,
+                'render': step['render'],
+                'mask_synt': step['mask_synt'],
+                'trans_2d_base': trans_2d_base,
+                'depth_id_base': depth_id_base}
+
+    def forward(self, inputs, aux, targets=None, n_refine_iters=1,
+                grad_ckpt=False):
+        if n_refine_iters < 1:
+            raise ValueError('n_refine_iters must be >= 1')
+        weights = cfg.REFINE_ITER_WEIGHTS
+        if weights is not None and len(weights) < n_refine_iters:
+            raise ValueError(
+                'REFINE_ITER_WEIGHTS has {} entries but '
+                'n_refine_iters={}'.format(len(weights), n_refine_iters))
+
+        # Classification bootstrap: unchanged, always iteration 0.
         x1, mask_real = self.backbone(inputs, aux['obj_cls'])
         x_real_in = torch.concat([x1, mask_real.detach().sigmoid()], dim=1)
         x_clf = self.decoder(x_real_in)
         x_clf['fov'] = aux['fov']
         pose_logits, depth_logits, trans_logits = self.classifier(x_clf)
+        image_size = (cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE)
 
         with torch.no_grad():
             depth_id = torch.argmax(depth_logits, dim=-1)
@@ -426,7 +530,6 @@ class MRCNet(nn.Module):
             zero_res = torch.zeros(len(trans_logits), 2).to(trans_logits)
             trans_xy = utils.trans_from_bins(trans_logits, zero_res)
             trans_persp = torch.cat([trans_xy, depth], dim=-1)
-            image_size = (cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE)
             trans_3d = utils.perspective_to_trans_3d(
                 trans_persp, image_size, aux['intrinsics'])
 
@@ -435,34 +538,89 @@ class MRCNet(nn.Module):
                 pose_id, num_classes=self.n_pose_bin))
             rot_init = utils.quaternion_to_rotation(quat_init)
 
-            out = self.renderer.render(
-                aux['obj_cls'], rot_init, trans_3d,
-                [rendering.CameraView(K=aux['intrinsics'])])
-            render = out['rgb'][:, 0]
-            render_mask = out['mask'][:, 0]
-            render_map = out['bbox_map'][:, 0]
+        # Iteration 0 bootstraps from the classification argmax; later
+        # iterations re-render and refine the previous estimate.
+        R_cur, t_cur = rot_init, trans_3d
+        predictions = None
+        losses = {}
+        for k in range(n_refine_iters):
+            step = self._refine_step(
+                x_clf, R_cur, t_cur, aux, grad_ckpt=grad_ckpt)
+            if k == 0:
+                predictions = self._make_predictions(
+                    mask_real, step['mask_synt'], pose_logits, depth_logits,
+                    trans_logits, step['pose_res'], step['depth_res'],
+                    step['trans_res'])
+                predictions['render'] = step['render']
+                predictions['mask_synt'] = step['mask_synt']
+                trans_2d_base = trans_xy
+                depth_id_base = depth_id
+                if targets:
+                    targets['quat_init'] = quat_init
+                    targets['trans_2d'] = trans_2d_base
+                    targets['depth_id'] = depth_id_base
+                    iter_losses = self._compute_loss(predictions, targets)
+            else:
+                predictions = self._compose_refine(
+                    step, R_cur, t_cur, aux, mask_real)
+                predictions['quat_bin'] = pose_logits
+                predictions['depth_bin'] = depth_logits
+                predictions['trans_logits'] = trans_logits
+                trans_2d_base = predictions.pop('trans_2d_base')
+                depth_id_base = predictions.pop('depth_id_base')
+                if targets:
+                    iter_losses = self._compute_refine_loss(
+                        predictions, targets, R_cur, t_cur, trans_2d_base,
+                        depth_id_base)
 
-        sync_inputs = torch.concat([render, render_map], dim=1)
-        x2, mask_synt = self.backbone(sync_inputs, aux['obj_cls'])
-        x_synt_in = torch.concat([x2, mask_synt.detach().sigmoid()], dim=1)
-        x_reg = self.decoder(x_clf, x_synt_in)
-        predictions = {'render': render,
-                       'mask_synt': mask_synt}
-        x_reg['fov'] = torch.concat([
-            trans_3d[..., :2] / trans_3d[..., -1:],
-            aux['fov'][..., 2:]], dim=1)
-        pose_res, depth_res, trans_res = self.regressor(x_reg)
-        predictions.update(self._make_predictions(
-            mask_real, mask_synt, pose_logits, depth_logits,
-            trans_logits, pose_res, depth_res, trans_res))
+            if targets:
+                weight = 1.0 if weights is None else float(weights[k])
+                for name, value in iter_losses.items():
+                    if weight != 1.0:
+                        value = value * weight
+                    key = name if k == 0 else 'iter{}/{}'.format(k, name)
+                    losses[key] = value
 
-        # Provide loss values whenever targets are available
+            if k < n_refine_iters - 1:
+                R_cur = predictions['roi_obj_R']
+                t_cur = utils.perspective_to_trans_3d(
+                    predictions['translation'], image_size, aux['intrinsics'])
+
         if targets:
-            targets['quat_init'] = quat_init
-            targets['trans_2d'] = trans_xy
-            targets['depth_id'] = depth_id
-            predictions['losses'] = self._compute_loss(predictions, targets)
+            predictions['losses'] = losses
         return predictions
+
+    def _compute_refine_loss(self, predictions, targets, R_cur, t_cur,
+                             trans_2d_base, depth_id_base):
+        """Deep supervision of a refinement iteration's residual.
+
+        The GT symmetry group is re-matched against this iteration's pose
+        (same disambiguation as ``_compute_loss``) and only the regression
+        terms are returned, since the classification heads are not re-run.
+        """
+        image_size = (cfg.INPUT_SIZE, cfg.INPUT_SIZE)  # constant
+
+        quat_gt = utils.rotation_to_quaternion(targets['roi_obj_R'])
+        trans_gt = targets['roi_obj_t']
+        quat_pred = utils.rotation_to_quaternion(predictions['roi_obj_R'])
+        trans_pred = utils.perspective_to_trans_3d(
+            predictions['translation'], image_size, targets['roi_camK'])
+        cad = self.registry.gather(targets['obj_cls'])
+        quat_gt, trans_gt = utils.top_matched_pose(
+            quat_gt, trans_gt, quat_pred, trans_pred,
+            cad['vertices_correlation'],
+            cad['quaternion_symmetries'],
+            cad['translation_symmetries'], cad['symmetries_mask'])
+
+        loss_dict = utils.vertex_rotation_reg_loss(
+            predictions['quat_res'], quat_gt, R_cur.detach(),
+            cad['vertices'], cad['vertices_mask'],
+            image_size, targets['roi_camK'], self.use_6d)
+        loss_dict.update(utils.vertex_translation_reg_loss(
+            predictions['trans_res'], trans_2d_base, trans_gt,
+            predictions['depth_res'], depth_id_base, targets['roi_camK'],
+            image_size, self.depth_min, self.depth_max, self.n_depth_bin))
+        return loss_dict
 
     def _compute_loss(self, predictions, targets):
         assert 'roi_obj_R' in targets
