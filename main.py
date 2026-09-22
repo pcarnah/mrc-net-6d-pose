@@ -146,7 +146,9 @@ def main_worker(rank, world_size, args):
                     batch_image_roi,
                     {'obj_cls': targets['obj_cls'],
                      'fov': targets['fov'],
-                     'intrinsics': targets['roi_camK']}, targets)
+                     'intrinsics': targets['roi_camK']}, targets,
+                    n_refine_iters=args.n_refine_iters,
+                    grad_ckpt=args.refine_grad_ckpt)
                 loss_dict = predictions['losses']
                 loss = sum(loss_dict.values())
                 loss.backward()
@@ -217,7 +219,16 @@ if __name__ == '__main__':
     parser.add_argument('--pretrained', type=str, default=None,
                         help='optional checkpoint to initialise the network '
                              'from (fresh init when omitted)')
+    parser.add_argument('--n_refine_iters', type=int, default=1,
+                        help='number of weight-shared iterative refinement '
+                             'passes (1 = single-pass forward)')
+    parser.add_argument('--refine_grad_ckpt', action='store_true',
+                        help='gradient-checkpoint the refinement synthetic '
+                             'branch (overrides config.REFINE_GRAD_CKPT)')
     args = parser.parse_args()
+
+    # config.REFINE_GRAD_CKPT is the default; the CLI flag only turns it on.
+    args.refine_grad_ckpt = args.refine_grad_ckpt or bop_cfg.REFINE_GRAD_CKPT
 
     if args.is_parallel:
         # Training on single node
