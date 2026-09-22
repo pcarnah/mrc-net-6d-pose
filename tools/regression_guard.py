@@ -5,9 +5,14 @@ prediction tensor (plus the state_dict key list) under
 ``.cache/regression/reference.pt``.  `check` re-runs the identical batch and
 verifies that the state_dict keys and all prediction tensors are unchanged.
 
-The renderer loads CAD meshes from ``/mnt/d/6DPose/usprobe/models`` so this
-script only works in an environment where that path exists (WSL + conda env
-``mrcnet``).
+The renderer loads CAD meshes from ``config.DATASET_ROOT/usprobe/models`` so
+this script only works where that path exists (native Windows ``.venv`` or the
+legacy WSL/conda env).
+
+A deterministic ``targets`` dict is also run through ``forward`` and every
+loss value is captured alongside the prediction tensors, giving a second
+bit-for-bit gate for the loss refactor (the prediction check alone runs
+without targets).
 """
 import argparse
 import os
@@ -41,6 +46,12 @@ PRED_KEYS = [
     'roi_mask', 'roi_mask_synt', 'roi_obj_R', 'quat_bin', 'quat_res',
     'depth_bin', 'depth_res', 'trans_xy', 'trans_logits', 'trans_res',
     'translation', 'render', 'mask_synt',
+]
+
+# Every loss value produced by ``forward`` when ``targets`` is provided.
+LOSS_KEYS = [
+    'quat_clf', 'quat_reg', 'depth_clf', 'txty_clf', 'txty_reg', 'tz_reg',
+    'mask_visib',
 ]
 
 
@@ -96,6 +107,37 @@ def build_inputs(device):
     return inputs, aux
 
 
+def build_targets(device, aux):
+    """Deterministic targets dict for the loss reference.
+
+    Only the keys consumed by ``MRCNet._compute_loss`` (plus the renderer
+    conditioning shared with ``aux``) are provided; ``quat_init``, ``trans_2d``
+    and ``depth_id`` are filled in by ``forward`` itself from its own
+    predictions.
+    """
+    torch.manual_seed(cfg.RANDOM_SEED + 1)
+    quat = torch.randn(BATCH, 4)
+    quat = quat / torch.norm(quat, dim=-1, keepdim=True)
+    roi_obj_R = utils.quaternion_to_rotation(quat)
+    roi_obj_t = torch.stack([
+        0.1 * torch.randn(BATCH),
+        0.1 * torch.randn(BATCH),
+        0.2 + 0.2 * torch.rand(BATCH)], dim=-1)
+    roi_mask = (torch.rand(
+        BATCH, cfg.MASK_SIZE, cfg.MASK_SIZE) > 0.5).float()
+    quat_bin = torch.softmax(torch.randn(BATCH, cfg.N_POSE_BIN), dim=-1)
+    targets = {
+        'roi_obj_R': roi_obj_R,
+        'roi_obj_t': roi_obj_t,
+        'roi_mask': roi_mask,
+        'quat_bin': quat_bin,
+        'roi_camK': aux['intrinsics'].clone(),
+        'obj_cls': aux['obj_cls'].clone(),
+        'fov': aux['fov'].clone(),
+    }
+    return {key: value.to(device) for key, value in targets.items()}
+
+
 def build_model(device):
     model_config = cfg.ModelConfig.from_dataset_config(DATASET)
     model = models.MRCNet(model_config).to(device)
@@ -105,16 +147,22 @@ def build_model(device):
     return model
 
 
-def run_forward(model, device):
+def run_forward(model, device, with_targets=False):
     inputs, aux = build_inputs(device)
     with torch.no_grad():
         try:
             torch.use_deterministic_algorithms(True)
-            preds = model(inputs, aux)
+            if with_targets:
+                preds = model(inputs, aux, build_targets(device, aux))
+            else:
+                preds = model(inputs, aux)
             mode = 'strict'
         except RuntimeError:
             torch.use_deterministic_algorithms(True, warn_only=True)
-            preds = model(inputs, aux)
+            if with_targets:
+                preds = model(inputs, aux, build_targets(device, aux))
+            else:
+                preds = model(inputs, aux)
             mode = 'warn'
     return preds, mode
 
@@ -123,6 +171,7 @@ def capture(device):
     setup_determinism()
     model = build_model(device)
     preds, mode = run_forward(model, device)
+    loss_preds, loss_mode = run_forward(model, device, with_targets=True)
     os.makedirs(REF_DIR, exist_ok=True)
 
     state_keys = sorted(model.state_dict().keys())
@@ -135,14 +184,25 @@ def capture(device):
         tensors[key] = value.detach().cpu().clone()
         shapes[key] = tuple(value.shape)
 
+    assert 'losses' in loss_preds, 'forward(with targets) returned no losses'
+    losses = {}
+    for key in LOSS_KEYS:
+        assert key in loss_preds['losses'], \
+            'missing loss key: {}'.format(key)
+        losses[key] = loss_preds['losses'][key].detach().cpu().clone()
+
     torch.save({
         'state_keys': state_keys,
         'tensors': tensors,
         'shapes': shapes,
         'det_mode': mode,
+        'losses': losses,
+        'loss_det_mode': loss_mode,
     }, REF_PATH)
-    print('Captured reference to {} ({} keys, determinism={})'.format(
-        REF_PATH, len(state_keys), mode))
+    print('Captured reference to {} ({} state keys, determinism={} and {} '
+          'with targets)'.format(REF_PATH, len(state_keys), mode, loss_mode))
+    for key in LOSS_KEYS:
+        print('  loss {:<11} {:.6e}'.format(key, float(losses[key])))
 
 
 def check(device):
@@ -184,6 +244,32 @@ def check(device):
         print('{:<14} {} max_abs_diff={:.3e}'.format(key, status, max_diff))
         if not ok:
             failures.append('{} max_abs_diff={:.3e}'.format(key, max_diff))
+
+    if 'losses' in ref:
+        loss_preds, loss_mode = run_forward(model, device, with_targets=True)
+        if loss_mode != ref.get('loss_det_mode', loss_mode):
+            print('WARNING: loss determinism mode changed {} -> {}'.format(
+                ref.get('loss_det_mode'), loss_mode))
+        if 'losses' not in loss_preds:
+            failures.append('forward(with targets) returned no losses')
+        else:
+            for key in LOSS_KEYS:
+                if key not in ref['losses']:
+                    failures.append('loss {} missing from reference'.format(key))
+                    continue
+                if key not in loss_preds['losses']:
+                    failures.append('loss {} missing from forward'.format(key))
+                    continue
+                ref_l = ref['losses'][key].float()
+                new_l = loss_preds['losses'][key].detach().cpu().float()
+                max_diff = float((new_l - ref_l).abs().max())
+                ok = torch.allclose(new_l, ref_l, rtol=1e-5, atol=1e-6)
+                status = 'OK' if ok else 'FAIL'
+                print('loss/{:<9} {} max_abs_diff={:.3e}'.format(
+                    key, status, max_diff))
+                if not ok:
+                    failures.append('loss {} max_abs_diff={:.3e}'.format(
+                        key, max_diff))
 
     if failures:
         print('\nREGRESSION GUARD FAILED:')
