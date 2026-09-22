@@ -499,8 +499,31 @@ class MRCNet(nn.Module):
                 'trans_2d_base': trans_2d_base,
                 'depth_id_base': depth_id_base}
 
+    def _refine_residual_mag(self, predictions):
+        """Batch-level magnitude of the residual applied in one iteration.
+
+        Relative rotation angle plus the depth residual normalized by the
+        current depth.  A single scalar for the whole batch, so inference-only
+        early stopping can never make the shared refinement path diverge
+        per sample.
+        """
+        if self.use_6d:
+            R_res = utils.compute_rotation_matrix_from_ortho6d(
+                predictions['quat_res'])
+            rot = utils.rotation_angle(R_res)
+        else:
+            rot = utils.angle_between_quaternion(
+                predictions['quat_res'],
+                torch.tensor(
+                    [[1., 0., 0., 0.]],
+                    device=predictions['quat_res'].device),
+                is_degree=False)
+        depth = predictions['translation'][..., -1:].abs().clamp(min=1e-6)
+        trans = predictions['depth_res'].abs() / depth
+        return float(torch.maximum(rot.max(), trans.max()))
+
     def forward(self, inputs, aux, targets=None, n_refine_iters=1,
-                grad_ckpt=False):
+                grad_ckpt=False, refine_stop_thresh=0.0):
         if n_refine_iters < 1:
             raise ValueError('n_refine_iters must be >= 1')
         weights = cfg.REFINE_ITER_WEIGHTS
@@ -543,6 +566,8 @@ class MRCNet(nn.Module):
         R_cur, t_cur = rot_init, trans_3d
         predictions = None
         losses = {}
+        refine_iters_used = n_refine_iters
+        residual_mag = None
         for k in range(n_refine_iters):
             step = self._refine_step(
                 x_clf, R_cur, t_cur, aux, grad_ckpt=grad_ckpt)
@@ -585,9 +610,17 @@ class MRCNet(nn.Module):
                 R_cur = predictions['roi_obj_R']
                 t_cur = utils.perspective_to_trans_3d(
                     predictions['translation'], image_size, aux['intrinsics'])
+                if refine_stop_thresh > 0:
+                    residual_mag = self._refine_residual_mag(predictions)
+                    if residual_mag < refine_stop_thresh:
+                        refine_iters_used = k + 1
+                        break
 
         if targets:
             predictions['losses'] = losses
+        if n_refine_iters > 1:
+            predictions['refine_iters_used'] = refine_iters_used
+            predictions['refine_residual_mag'] = residual_mag
         return predictions
 
     def _compute_refine_loss(self, predictions, targets, R_cur, t_cur,

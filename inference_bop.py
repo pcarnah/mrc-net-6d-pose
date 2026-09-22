@@ -38,7 +38,8 @@ def rle2mask(rle, height, width):
     return mask
 
 
-def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz):
+def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
+                   n_refine_iters=1, refine_stop_thresh=0.0):
     batch_image = torch.from_numpy(roi_rgb).to(device)
     batch_obj_cls = torch.from_numpy(obj_cls).to(device)
     im_height, im_width = batch_image.shape[2:]
@@ -54,7 +55,11 @@ def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz):
         predictions = net(batch_input,
                           {'obj_cls': batch_obj_cls,
                            'fov': batch_fov,
-                           'intrinsics': intrinsics})
+                           'intrinsics': intrinsics},
+                          n_refine_iters=n_refine_iters,
+                          refine_stop_thresh=refine_stop_thresh)
+        # All 4 Rz crops are iterated together and the single best pose is
+        # selected from the (shared) classification logits at the end.
         R_conf = predictions['quat_bin']
         R_index = torch.argmax(torch.amax(R_conf, dim=1))
         t_conf = predictions['depth_bin']
@@ -80,12 +85,21 @@ if __name__ == '__main__':
     parser.add_argument('--output_suffix', type=str, default='')
     parser.add_argument('--is_real', action='store_true')
     parser.add_argument('--model_name', type=str, default='')
+    parser.add_argument('--n_refine_iters', type=int, default=1,
+                        help='number of weight-shared iterative refinement '
+                             'passes (1 = single-pass forward)')
+    parser.add_argument('--refine_stop_thresh', type=float, default=0.0,
+                        help='early-stop refinement when the batch-level '
+                             'residual magnitude falls below this value '
+                             '(0 = disabled; requires --n_refine_iters > 1)')
     args = parser.parse_args()
 
     p = {
         'dataset': args.dataset,
-        'bop_root': r'/mnt/d/6DPose',
-        'eval_root': r'/mnt/d/6DPose',
+        # Single source of truth lives in config (D:/6DPose natively,
+        # /mnt/d/6DPose under WSL).
+        'bop_root': bop_cfg.DATASET_ROOT,
+        'eval_root': bop_cfg.EVAL_ROOT,
         'output_suffix_name': '{}_{}'.format(
             args.checkpoint_name, args.output_suffix),
         'checkpoint': './{}/{}.pth'.format(args.checkpoint_name,
@@ -299,9 +313,13 @@ if __name__ == '__main__':
             b_fov = np.stack(b_fov, axis=0)
             b_Rz = np.stack(b_Rz, axis=0)
 
+            stop_thresh = (args.refine_stop_thresh
+                           if args.n_refine_iters > 1 else 0.0)
             (est_R, est_t), run_time = timed(lambda: inference_func(
                 net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
-                b_roi_camK, b_fov, b_Rz))
+                b_roi_camK, b_fov, b_Rz,
+                n_refine_iters=args.n_refine_iters,
+                refine_stop_thresh=stop_thresh))
             print(run_time)
 
             view_objs_ts.append(est_t)
