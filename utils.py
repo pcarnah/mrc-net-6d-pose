@@ -256,6 +256,23 @@ def quantize_depth(depth, depth_min, depth_max, n_depth_bin,
     return depth_prob, depth_res
 
 
+def nearest_depth_bin(depth, depth_min, depth_max, n_depth_bin):
+    """
+    Index of the depth bin whose centre is closest to ``depth``
+
+    Inputs:
+      depth: perspective depth (N,)
+      (depth_min, depth_max): range of perspective depth
+      n_depth_bin: number of bins to quantize depth into
+
+    Outputs:
+      depth_id: index of the closest bin (N,)
+    """
+    return torch.argmax(
+        quantize_depth(
+            depth, depth_min, depth_max, n_depth_bin)[0], dim=-1)
+
+
 def depth_from_bin_logits(depth_scores, depth_res,
                           depth_min, depth_max, n_depth_bin):
     """
@@ -681,6 +698,40 @@ def vertex_loss_quaternion(q_pred, t_pred, q_gt, t_gt, vertices, vertices_mask,
     return loss
 
 
+def vertex_rotation_reg_loss(q_pred_res, q_gt, R_init, vertices,
+                             vertices_mask, image_size, intrinsics, use_6d):
+    """
+    Rotation regression term from multi-bin pose residuals, without the
+    classification head. Used per refinement iteration and by
+    ``vertex_rotation_loss``.
+
+    Inputs:
+      q_pred_res: predicted quaternion residual (N, 4) or 6D residual (N, 6)
+      q_gt: ground truth quaternion (N, 4)
+      R_init: base rotation matrix the residual is composed onto (N, 3, 3)
+      vertices: vertices of object model (N, V, 3)
+      vertices_mask: takes value 1 wherever the vertex is valid (N, V)
+      image_size: tuple image size in (height, width) format
+      intrinsics: camera intrinsics matrices (N, 3, 3)
+      use_6d: whether residuals are 6D rotations (from ModelConfig)
+
+    Outputs:
+      loss_dict: {'quat_reg': weighted scalar}
+    """
+
+    if use_6d:
+        R_pred_res = compute_rotation_matrix_from_ortho6d(q_pred_res)
+        R_pred = R_pred_res @ R_init
+        reg_loss = vertex_loss_rotation(
+            R_pred, None, q_gt, None, vertices, vertices_mask, intrinsics)
+    else:
+        q_pred = multiply_quaternion(q_pred_res, rotation_to_quaternion(R_init))
+        reg_loss = vertex_loss_quaternion(
+            q_pred, None, q_gt, None, vertices, vertices_mask, intrinsics)
+
+    return {'quat_reg': torch.mean(reg_loss) * cfg.WEIGHT_QUAT_REG}
+
+
 def vertex_rotation_loss(q_pred_logits, q_pred_res, q_gt, q_gt_bin, q_init,
                          vertices, vertices_mask, image_size, intrinsics,
                          use_6d):
@@ -704,22 +755,14 @@ def vertex_rotation_loss(q_pred_logits, q_pred_res, q_gt, q_gt_bin, q_init,
       loss: scalar multibin loss
     """
 
-    if use_6d:
-        R_init = quaternion_to_rotation(q_init)
-        R_pred_res = compute_rotation_matrix_from_ortho6d(q_pred_res)
-        R_pred = R_pred_res @ R_init
-        reg_loss = vertex_loss_rotation(
-            R_pred, None, q_gt, None, vertices, vertices_mask, intrinsics)
-    else:
-        q_pred = multiply_quaternion(q_pred_res, q_init)
-        reg_loss = vertex_loss_quaternion(
-            q_pred, None, q_gt, None, vertices, vertices_mask, intrinsics)
-
+    R_init = quaternion_to_rotation(q_init)
+    reg_loss_dict = vertex_rotation_reg_loss(
+        q_pred_res, q_gt, R_init, vertices, vertices_mask, image_size,
+        intrinsics, use_6d)
     clf_loss = focal_loss(
         q_gt_bin, q_pred_logits, weights=[10.0, 0.1], reduction='none')
-    loss_dict = {
-        'quat_clf': torch.mean(clf_loss) * cfg.WEIGHT_QUAT_CLF,
-        'quat_reg': torch.mean(reg_loss) * cfg.WEIGHT_QUAT_REG}
+    loss_dict = {'quat_clf': torch.mean(clf_loss) * cfg.WEIGHT_QUAT_CLF}
+    loss_dict.update(reg_loss_dict)
     return loss_dict
 
 
@@ -766,6 +809,50 @@ def quantize_persp_trans(t_gt, intrinsics, image_size, beta=4.0):
     return xy_weights
 
 
+def vertex_translation_reg_loss(t_res_pred, trans_2d_base, t_gt,
+                                depth_res_pred, depth_id_base, intrinsics,
+                                image_size, depth_min, depth_max,
+                                n_depth_bin):
+    """
+    Translation regression terms (2D center and depth) without the
+    classification heads. Used per refinement iteration and by
+    ``vertex_translation_loss``.
+
+    Inputs:
+      t_res_pred: predicted xy translation residual (N, 2)
+      trans_2d_base: perspective 2D translation the residual is added to (N, 2)
+      t_gt: ground truth translation (N, 3)
+      depth_res_pred: predicted residual depth (N, 1)
+      depth_id_base: depth bin index the residual is added to (N,)
+      intrinsics: camera intrinsics matrices (N, 3, 3)
+      image_size: tuple image size in (height, width) format
+      (depth_min, depth_max): range of perspective depth
+      n_depth_bin: number of bins to quantize depth into
+
+    Outputs:
+      loss_dict: {'txty_reg', 'tz_reg'} weighted scalars
+    """
+
+    t_gt_persp = trans_3d_to_perspective(t_gt, image_size, intrinsics)
+    t_pred_xy = perspective_to_trans_3d(
+        torch.concat([trans_2d_base + t_res_pred, t_gt_persp[:, -1:]], dim=-1),
+        image_size, intrinsics)
+    xy_loss = smooth_l1_loss(t_pred_xy - t_gt, beta=1.0)  # (N,)
+
+    depth_bins = make_depth_bins(
+        depth_min, depth_max, n_depth_bin, device=t_gt.device)
+    depth_pred = depth_res_pred + depth_bins  # (N, B)
+    depth_pred = torch.gather(
+        depth_pred, dim=-1, index=depth_id_base.unsqueeze(-1))  # (N, 1)
+    t_pred_z = torch.concat(
+        [t_gt_persp[:, :-1], depth_pred], dim=-1)  # (N, 3)
+    t_pred_z = perspective_to_trans_3d(t_pred_z, image_size, intrinsics)
+    z_loss = smooth_l1_loss(t_pred_z - t_gt, beta=1.0, reduction='none')
+    return {
+        'txty_reg': torch.mean(xy_loss) * cfg.WEIGHT_TRANS_REG,
+        'tz_reg': torch.mean(z_loss) * cfg.WEIGHT_DEPTH_REG}
+
+
 def vertex_translation_loss(t_logits, t_res_pred, trans_2d, t_gt,
                             depth_bin_pred, depth_res_pred, depth_id_gt,
                             intrinsics, image_size,
@@ -795,29 +882,17 @@ def vertex_translation_loss(t_logits, t_res_pred, trans_2d, t_gt,
         xy_weights, t_logits, reduction='none')
 
     t_gt_persp = trans_3d_to_perspective(t_gt, image_size, intrinsics)
-    t_pred_xy = perspective_to_trans_3d(
-        torch.concat([trans_2d + t_res_pred, t_gt_persp[:, -1:]], dim=-1),
-        image_size, intrinsics)
-    xy_loss = smooth_l1_loss(t_pred_xy - t_gt, beta=1.0)  # (N, C*C)
-
     depth_bin_gt = quantize_depth(
         t_gt_persp[..., -1], depth_min, depth_max, n_depth_bin)[0]
     depth_clf_loss = multiclass_focal_loss(
         depth_bin_gt, depth_bin_pred, reduction='none')
-    depth_bins = make_depth_bins(
-        depth_min, depth_max, n_depth_bin, device=depth_bin_gt.device)
-    depth_pred = depth_res_pred + depth_bins  # (N, B)
-    depth_pred = torch.gather(
-        depth_pred, dim=-1, index=depth_id_gt.unsqueeze(-1))  # (N, 1)
-    t_pred_z = torch.concat(
-        [t_gt_persp[:, :-1], depth_pred], dim=-1)  # (N, 3)
-    t_pred_z = perspective_to_trans_3d(t_pred_z, image_size, intrinsics)
-    z_loss = smooth_l1_loss(t_pred_z - t_gt, beta=1.0, reduction='none')
+
     loss_dict = {
         'depth_clf': torch.mean(depth_clf_loss) * cfg.WEIGHT_DEPTH_CLF,
-        'txty_clf': torch.mean(trans_clf_loss) * cfg.WEIGHT_TRANS_CLF,
-        'txty_reg': torch.mean(xy_loss) * cfg.WEIGHT_TRANS_REG,
-        'tz_reg': torch.mean(z_loss) * cfg.WEIGHT_DEPTH_REG}
+        'txty_clf': torch.mean(trans_clf_loss) * cfg.WEIGHT_TRANS_CLF}
+    loss_dict.update(vertex_translation_reg_loss(
+        t_res_pred, trans_2d, t_gt, depth_res_pred, depth_id_gt, intrinsics,
+        image_size, depth_min, depth_max, n_depth_bin))
     return loss_dict
 
 
@@ -836,6 +911,21 @@ def angle_between_quaternion(q1, q2, is_degree=True):
     phi = 2 * torch.acos(torch.clamp(
         torch.abs(torch.sum(q1 * q2, dim=-1)), max=0.99999))
     return phi * 180. / PI if is_degree else phi
+
+
+def rotation_angle(rotation_matrix):
+    """
+    Rotation angle (in radians) of a batch of rotation matrices
+
+    Inputs:
+      rotation_matrix: rotation matrices (N, 3, 3)
+
+    Outputs:
+      theta: rotation angle per matrix in [0, pi] (N,)
+    """
+    trace = rotation_matrix[..., 0, 0] + rotation_matrix[..., 1, 1] \
+        + rotation_matrix[..., 2, 2]
+    return torch.acos(torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0))
 
 
 def unify_quaternion(quaternions):
