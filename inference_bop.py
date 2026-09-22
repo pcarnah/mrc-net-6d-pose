@@ -38,6 +38,28 @@ def rle2mask(rle, height, width):
     return mask
 
 
+def make_warmup_batch():
+    """Dummy 4-crop batch used to trigger torch.compile before the eval loop.
+
+    ``torch.compile`` is lazy, so an inductor failure only surfaces on the
+    first real call; warming up here lets the caller fall back to eager.
+    """
+    n = 4
+    size = bop_cfg.INPUT_IMG_SIZE
+    roi_rgb = np.zeros((n, 3, size, size), dtype=np.float32)
+    obj_cls = np.zeros(n, dtype=np.int64)
+    bbox_loc = np.tile(
+        np.array([0.25, 0.25, 0.75, 0.75], dtype=np.float32), (n, 1))
+    K = np.array([[400., 0., size / 2.],
+                  [0., 400., size / 2.],
+                  [0., 0., 1.]], dtype=np.float32)
+    roi_camK = np.tile(K[None], (n, 1, 1))
+    fov = np.zeros((n, 3), dtype=np.float32)
+    fov[:, 2] = 0.625
+    Rz = np.tile(np.eye(3, dtype=np.float32), (n, 1, 1))
+    return obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz
+
+
 def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
                    n_refine_iters=1, refine_stop_thresh=0.0):
     batch_image = torch.from_numpy(roi_rgb).to(device)
@@ -92,6 +114,9 @@ if __name__ == '__main__':
                         help='early-stop refinement when the batch-level '
                              'residual magnitude falls below this value '
                              '(0 = disabled; requires --n_refine_iters > 1)')
+    parser.add_argument('--no_compile', action='store_true',
+                        help='run the network eagerly instead of '
+                             'torch.compile(net)')
     args = parser.parse_args()
 
     p = {
@@ -129,7 +154,20 @@ if __name__ == '__main__':
     net.load_state_dict(checkpoint['network'])
     net.eval()
 
-    net = torch.compile(net)
+    if args.no_compile:
+        print('skipping torch.compile (--no_compile)')
+    else:
+        net = torch.compile(net)
+        try:
+            inference_func(net, device, *make_warmup_batch(),
+                           n_refine_iters=args.n_refine_iters,
+                           refine_stop_thresh=0.0)
+            print('torch.compile warm-up succeeded.')
+        except Exception as exc:
+            print('torch.compile failed on warm-up ({}); falling back to '
+                  'eager. Use --no_compile to skip the attempt.'.format(
+                      type(exc).__name__))
+            net = net._orig_mod
 
     est_pose_file = '{}/mrcnet_{}-test_{}.csv'.format(
         p['eval_root'], p['dataset'], p['output_suffix_name'])
