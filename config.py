@@ -134,9 +134,56 @@ DATASET_CONFIG = {
         'model_folders': {
             'train_pbr': 'models',
             'train_pbr_left': 'models',
-            'test': 'models_eval'},
+            'test': 'models_eval',
+            'test~left_pbr': 'models_eval'},
         'train_set': ['train_pbr_left'],
+        # NOTE: train_pbr_left_extras exists but is empty on disk; keep
+        # finetune on train_pbr_left until it is populated.
+        'finetune_set': ['train_pbr_left'],
         'test_set': ['test~left_pbr'],
+    },
+    'stereobj-1m': {
+        # WebDataset of stereo pairs (webds/{train,val,test}-*.tar).
+        # Each sample is a 2000x1000 side-by-side stereo pair: left eye at
+        # x in [0, 1000), right eye at x in [1000, 2000). Mono mode treats
+        # each eye as an independent scene.
+        'width': 1000,
+        'height': 1000,
+        'color_type': 'rgb',
+        'Tz_near': 0.100,
+        'Tz_far': 2.000,
+        'num_class': 18,
+        'id2mod': {name: name for name in [
+            'centrifuge_tube', 'microplate', 'pipette_0.5_10',
+            'pipette_10_100', 'pipette_100_1000', 'sterile_tip_rack_10',
+            'sterile_tip_rack_200', 'sterile_tip_rack_1000',
+            'tube_rack_1.5_2_ml', 'tube_rack_50_ml', 'blade_razor',
+            'hammer', 'needle_nose_pliers', 'screwdriver', 'side_cutters',
+            'tape_measure', 'wire_stripper', 'wrench']},
+        'id2cls': {name: i for i, name in enumerate([
+            'centrifuge_tube', 'microplate', 'pipette_0.5_10',
+            'pipette_10_100', 'pipette_100_1000', 'sterile_tip_rack_10',
+            'sterile_tip_rack_200', 'sterile_tip_rack_1000',
+            'tube_rack_1.5_2_ml', 'tube_rack_50_ml', 'blade_razor',
+            'hammer', 'needle_nose_pliers', 'screwdriver', 'side_cutters',
+            'tape_measure', 'wire_stripper', 'wrench'])},
+        'model_format': 'stereobj',
+        'model_folders': {
+            'train': 'objects',
+            'val': 'objects',
+            'test': 'objects'},
+        'loader': 'webds',
+        'webds_dir': 'webds',
+        'train_set': ['train'],
+        'finetune_set': ['train'],
+        # webds test shards carry images only (no labels); the annotated
+        # val shards are the eval split. Both splits resolve to the val
+        # shards; split='val' exposes them directly too.
+        'val_set': ['val'],
+        'test_set': ['val'],
+        # 'mono': each eye is an independent scene (PoseSample stays
+        # single-view). 'stereo': reserved for the future two-view model.
+        'stereo_mode': 'mono',
     },
     'usprobe': {
         'width': 1280,

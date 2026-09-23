@@ -5,6 +5,7 @@ import torch
 import random
 import numpy as np
 import bop_dataset as data
+import dataset_factory
 import models
 import argparse
 from tqdm import tqdm
@@ -17,10 +18,13 @@ import config as bop_cfg
 
 def worker_init_fn(*_):
     # each worker should only use one os thread
-    # numpy/cv2 takes advantage of multithreading by default
+    # numpy/cv2/torch take advantage of multithreading by default; left
+    # unchecked, N workers x all-cores oversubscribes the box and makes
+    # the CPU-bound lazy quaternion labels slower than single-threaded.
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     cv2.setNumThreads(0)
+    torch.set_num_threads(1)
 
     # random seed
     np.random.seed(bop_cfg.RANDOM_SEED)
@@ -46,7 +50,7 @@ def main_worker(rank, world_size, args):
     else:
         world_rank = rank
 
-    train_dataset = data.BOP_Dataset(
+    train_dataset = dataset_factory.create_dataset(
         args.dataset, split='train')
 
     model_config = bop_cfg.ModelConfig.from_dataset_config(args.dataset)
