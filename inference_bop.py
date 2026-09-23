@@ -60,6 +60,89 @@ def make_warmup_batch():
     return obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz
 
 
+def resolve_view_image_path(scene_dir, view_id):
+    """Resolve the per-view image path across the supported layouts.
+
+    Cascade: rgb/jpg -> gray/tif (ITODD) -> gray/bmp (usprobe) -> gray/png.
+    """
+    view_rgb_file = os.path.join(
+        scene_dir, 'rgb', '{:06d}.jpg'.format(view_id))
+    if not os.path.exists(view_rgb_file):
+        view_rgb_file = os.path.join(
+            # gray images in ITODD
+            scene_dir, 'gray', '{:06d}.tif'.format(view_id))
+    if not os.path.exists(view_rgb_file):
+        view_rgb_file = os.path.join(
+            # gray images in usprobe
+            scene_dir, 'gray', '{:06d}.bmp'.format(view_id))
+    if not os.path.exists(view_rgb_file):
+        view_rgb_file = os.path.join(
+            # gray images in usprobe
+            scene_dir, 'gray', '{:06d}.png'.format(view_id))
+    return view_rgb_file
+
+
+def build_rz_crop_batch(view_image, view_cam_K, det_bbox, box_scale,
+                        cx, cy, fx, fy, dataset_id2cls, inst_id):
+    """Build the 4-way Rz crop batch for one detected instance.
+
+    Returns ``(b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov)``.
+    """
+    x1, y1, x2, y2 = det_bbox
+    hr = (y2 - y1) / box_scale
+    wr = (x2 - x1) / box_scale
+
+    b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov \
+        = [], [], [], [], [], []
+    for rot_index in range(4):
+        rot_rad = rot_index * np.pi / 2
+        bbox_center = torch.as_tensor([cx, cy], dtype=torch.float32)
+        bbox_loc = np.array(
+            [0.5 - wr/2, 0.5 - hr/2, 0.5 + wr/2, 0.5 + hr/2])
+
+        Rz = np.array([[np.cos(rot_rad), -np.sin(rot_rad), 0.0],
+                       [np.sin(rot_rad), np.cos(rot_rad), 0.0],
+                       [0.0, 0.0, 1.0]], dtype=np.float32)
+        T_rot = view_cam_K @ Rz @ np.linalg.inv(view_cam_K)
+        center_hom = T_rot @ np.array(
+            [*bbox_center, 1.0], dtype=np.float32)
+        bbox_center = center_hom[:2]
+        fov = np.array([(bbox_center[0] - cx) / fx,
+                       (bbox_center[1] - cy) / fy, box_scale / fx])
+        b_Rz.append(Rz)
+        b_fov.append(fov)
+
+        Tz = np.array([[1.0, 0.0, -0.5],
+                       [0.0, 1.0, -0.5],
+                       [0.0, 0.0, 1.0]], dtype=np.float32)
+        T_loc = np.linalg.inv(Tz) @ Rz @ Tz
+        bbox_loc = utils.transform_bounding_box(bbox_loc, T_loc)
+        b_bbox_loc.append(bbox_loc)
+
+        # transformation from RGB image X to object-centric crop B
+        T_img2roi = misc.transform_to_local_ROIcrop(
+            bbox_center=bbox_center, bbox_scale=box_scale,
+            zoom_scale=bop_cfg.INPUT_IMG_SIZE)
+        roi_camK = T_img2roi @ view_cam_K
+        b_roi_camK.append(roi_camK)
+
+        roi_rgb = misc.crop_resize_by_warp_affine(
+            view_image.numpy(), np.array([cx, cy]), box_scale,
+            bop_cfg.INPUT_IMG_SIZE, view_cam_K, rot_rad,
+            interpolation='bilinear')
+        roi_rgb = roi_rgb / 255.0  # 1x3xHxW
+        b_roi_rgb.append(roi_rgb)
+        b_obj_cls.append(dataset_id2cls[inst_id])
+
+    b_obj_cls = np.stack(b_obj_cls, axis=0)
+    b_roi_rgb = np.stack(b_roi_rgb, axis=0)
+    b_bbox_loc = np.stack(b_bbox_loc, axis=0)
+    b_roi_camK = np.stack(b_roi_camK, axis=0)
+    b_fov = np.stack(b_fov, axis=0)
+    b_Rz = np.stack(b_Rz, axis=0)
+    return b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov
+
+
 def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
                    n_refine_iters=1, refine_stop_thresh=0.0):
     batch_image = torch.from_numpy(roi_rgb).to(device)
@@ -96,7 +179,14 @@ def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
         t_pred = Rz_inv @ np.expand_dims(t_pred.cpu().numpy(), axis=-1)
         t_pred = t_pred[t_index, :, 0]
 
-    return R_pred, t_pred
+    refine_stats = None
+    if n_refine_iters > 1:
+        refine_stats = {
+            'refine_iters_used': predictions.get('refine_iters_used'),
+            'refine_residual_mag': predictions.get('refine_residual_mag'),
+        }
+
+    return R_pred, t_pred, refine_stats
 
 
 if __name__ == '__main__':
@@ -234,6 +324,8 @@ if __name__ == '__main__':
     obj_runtime = list()
     view_runtime = list()
     bop19_pose_est_results = list()
+    refine_iters_all = list()
+    refine_resid_all = list()
     for ii, (scene_view_str, det_data) in enumerate(
             sorted(image_detect_dict.items())):
         eval_steps += 1
@@ -243,22 +335,7 @@ if __name__ == '__main__':
 
         scene_dir = '{}/{:06d}'.format(dp_data['split_path'], scene_id)
         scene_camK = file_io.load(os.path.join(scene_dir, 'scene_camera.json'))
-        view_rgb_file = os.path.join(
-            scene_dir, 'rgb', '{:06d}.jpg'.format(view_id))
-        if not os.path.exists(view_rgb_file):
-            view_rgb_file = os.path.join(
-                # gray images in ITODD
-                scene_dir, 'gray', '{:06d}.tif'.format(view_id))
-        if not os.path.exists(view_rgb_file):
-            view_rgb_file = os.path.join(
-                # gray images in usprobe
-                scene_dir, 'gray', '{:06d}.bmp'.format(view_id))
-        if not os.path.exists(view_rgb_file):
-            view_rgb_file = os.path.join(
-                # gray images in usprobe
-                scene_dir, 'gray', '{:06d}.png'.format(view_id))
-
-
+        view_rgb_file = resolve_view_image_path(scene_dir, view_id)
         view_cam_K = np.asarray(
             scene_camK[str(view_id)]['cam_K'],
             dtype=np.float32).reshape((3, 3))
@@ -277,6 +354,7 @@ if __name__ == '__main__':
         view_objs_Rs = list()
         view_objs_IDs = list()
         view_objs_scores = list()
+        view_objs_stats = list()
 
         for inst_ix, inst_id in enumerate(det_objIDs):
             if inst_id not in dataset_id2cls:
@@ -302,58 +380,13 @@ if __name__ == '__main__':
             fx, fy, ox, oy = view_cam_K[0, 0], view_cam_K[1, 1], \
                 view_cam_K[0, 2], view_cam_K[1, 2]
 
-            b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov \
-                = [], [], [], [], [], []
-            for rot_index in range(4):
-                rot_rad = rot_index * np.pi / 2
-                bbox_center = torch.as_tensor([cx, cy], dtype=torch.float32)
-                bbox_loc = np.array(
-                    [0.5 - wr/2, 0.5 - hr/2, 0.5 + wr/2, 0.5 + hr/2])
-
-                Rz = np.array([[np.cos(rot_rad), -np.sin(rot_rad), 0.0],
-                               [np.sin(rot_rad), np.cos(rot_rad), 0.0],
-                               [0.0, 0.0, 1.0]], dtype=np.float32)
-                T_rot = view_cam_K @ Rz @ np.linalg.inv(view_cam_K)
-                center_hom = T_rot @ np.array(
-                    [*bbox_center, 1.0], dtype=np.float32)
-                bbox_center = center_hom[:2]
-                fov = np.array([(bbox_center[0] - cx) / fx,
-                               (bbox_center[1] - cy) / fy, box_scale / fx])
-                b_Rz.append(Rz)
-                b_fov.append(fov)
-
-                Tz = np.array([[1.0, 0.0, -0.5],
-                               [0.0, 1.0, -0.5],
-                               [0.0, 0.0, 1.0]], dtype=np.float32)
-                T_loc = np.linalg.inv(Tz) @ Rz @ Tz
-                bbox_loc = utils.transform_bounding_box(bbox_loc, T_loc)
-                b_bbox_loc.append(bbox_loc)
-
-                # transformation from RGB image X to object-centric crop B
-                T_img2roi = misc.transform_to_local_ROIcrop(
-                    bbox_center=bbox_center, bbox_scale=box_scale,
-                    zoom_scale=bop_cfg.INPUT_IMG_SIZE)
-                roi_camK = T_img2roi @ view_cam_K
-                b_roi_camK.append(roi_camK)
-
-                roi_rgb = misc.crop_resize_by_warp_affine(
-                    view_image.numpy(), np.array([cx, cy]), box_scale,
-                    bop_cfg.INPUT_IMG_SIZE, view_cam_K, rot_rad,
-                    interpolation='bilinear')
-                roi_rgb = roi_rgb / 255.0  # 1x3xHxW
-                b_roi_rgb.append(roi_rgb)
-                b_obj_cls.append(dataset_id2cls[inst_id])
-
-            b_obj_cls = np.stack(b_obj_cls, axis=0)
-            b_roi_rgb = np.stack(b_roi_rgb, axis=0)
-            b_bbox_loc = np.stack(b_bbox_loc, axis=0)
-            b_roi_camK = np.stack(b_roi_camK, axis=0)
-            b_fov = np.stack(b_fov, axis=0)
-            b_Rz = np.stack(b_Rz, axis=0)
-
+            b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
+                build_rz_crop_batch(view_image, view_cam_K, det_bboxes[inst_ix],
+                                    box_scale, cx, cy, fx, fy,
+                                    dataset_id2cls, inst_id)
             stop_thresh = (args.refine_stop_thresh
                            if args.n_refine_iters > 1 else 0.0)
-            (est_R, est_t), run_time = timed(lambda: inference_func(
+            (est_R, est_t, est_stats), run_time = timed(lambda: inference_func(
                 net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
                 b_roi_camK, b_fov, b_Rz,
                 n_refine_iters=args.n_refine_iters,
@@ -364,6 +397,7 @@ if __name__ == '__main__':
             view_objs_Rs.append(est_R)
             view_objs_IDs.append(inst_id)
             view_objs_scores.append(inst_score)
+            view_objs_stats.append(est_stats)
             inst_time.append(time.time() - inst_timer)
 
         view_cost = np.sum(inst_time)
@@ -375,13 +409,19 @@ if __name__ == '__main__':
             est_t = view_objs_ts[eix]
             est_R = view_objs_Rs[eix]
             det_conf = view_objs_scores[eix]
-            bop19_pose_est_results.append({'time': view_cost,
-                                           'scene_id': int(scene_id),
-                                           'im_id': int(view_id),
-                                           'obj_id': int(obj_id),
-                                           'score': det_conf,
-                                           'R': est_R,
-                                           't': est_t})
+            result = {'time': view_cost,
+                      'scene_id': int(scene_id),
+                      'im_id': int(view_id),
+                      'obj_id': int(obj_id),
+                      'score': det_conf,
+                      'R': est_R,
+                      't': est_t}
+            if args.n_refine_iters > 1 and view_objs_stats[eix] is not None:
+                result.update(view_objs_stats[eix])
+                refine_iters_all.append(view_objs_stats[eix]['refine_iters_used'])
+                refine_resid_all.append(
+                    view_objs_stats[eix]['refine_residual_mag'])
+            bop19_pose_est_results.append(result)
 
         if eval_steps % 10 == 0:
             time_stamp = time.strftime('%m-%d_%H:%M:%S', time.localtime())
@@ -392,4 +432,12 @@ if __name__ == '__main__':
                 time_stamp))
 
     inout.save_bop_results(est_pose_file, bop19_pose_est_results)
+    if refine_iters_all:
+        print('Refinement iterations used: mean={:.2f} min={} max={}'.format(
+            float(np.mean(refine_iters_all)),
+            int(np.min(refine_iters_all)), int(np.max(refine_iters_all))))
+        print('Final residual magnitude: mean={:.4f} min={:.4f} max={:.4f}'
+              .format(float(np.mean(refine_resid_all)),
+                      float(np.min(refine_resid_all)),
+                      float(np.max(refine_resid_all))))
     print('Results saved to {}.'.format(est_pose_file))

@@ -109,7 +109,7 @@ DATASET_CONFIG = {
         'color_type': 'rgb',
         'Tz_near': 0.010,
         'Tz_far': 2.150,
-        'num_class': 15,
+        'num_class': 8,
         'id2mod': {v: "obj_{:02d}".format(v) for v in [
             1, 5, 6, 8, 9, 10, 11, 12]},
         'id2cls': {v: i for i, v in enumerate([
@@ -156,6 +156,36 @@ DATASET_CONFIG = {
         'test_set': ['test'],
     }
 }
+
+
+def validate_dataset_config():
+    """Validate every DATASET_CONFIG entry; raise ValueError on the first
+    inconsistency found. Cheap and dict-only, safe to call at import time.
+    """
+    required_keys = ('width', 'height', 'color_type', 'Tz_near', 'Tz_far',
+                     'num_class', 'id2mod', 'id2cls', 'model_folders',
+                     'train_set', 'test_set')
+    for name, ds_cfg in DATASET_CONFIG.items():
+        missing = [k for k in required_keys if k not in ds_cfg]
+        if missing:
+            raise ValueError(
+                'DATASET_CONFIG[{}]: missing required keys {}'.format(
+                    name, missing))
+        if ds_cfg['color_type'] not in ('rgb', 'gray'):
+            raise ValueError(
+                "DATASET_CONFIG[{}]: color_type must be 'rgb' or 'gray', "
+                "got {!r}".format(name, ds_cfg['color_type']))
+        if len(ds_cfg['id2cls']) != ds_cfg['num_class']:
+            raise ValueError(
+                'DATASET_CONFIG[{}]: len(id2cls)={} != num_class={}'.format(
+                    name, len(ds_cfg['id2cls']), ds_cfg['num_class']))
+        if set(ds_cfg['id2cls']) != set(ds_cfg['id2mod']):
+            raise ValueError(
+                'DATASET_CONFIG[{}]: id2cls keys {} != id2mod keys {}'.format(
+                    name, sorted(ds_cfg['id2cls']), sorted(ds_cfg['id2mod'])))
+
+
+validate_dataset_config()
 
 
 @dataclass(frozen=True)
