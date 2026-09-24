@@ -570,6 +570,7 @@ class StereobjDataset(PoseDataset):
         cls = self.dataset_id2cls[obj_name]
         registry = self.registry
         num_v = int(registry.quant_points_mask[cls].sum().item())
+
         verts = registry.quant_points[cls][:num_v]
         vmask = registry.quant_points_mask[cls][:num_v]
         diam = registry.diameter[cls]
@@ -578,22 +579,27 @@ class StereobjDataset(PoseDataset):
         tsym = registry.translation_symmetries[cls]
         smask = registry.symmetries_mask[cls]
 
-        rz = np.stack([[[np.cos(r * np.pi / 2), -np.sin(r * np.pi / 2), 0.],
-                        [np.sin(r * np.pi / 2), np.cos(r * np.pi / 2), 0.],
-                        [0., 0., 1.]] for r in range(4)]).astype(np.float32)
-        composed = np.einsum('rij,jk->rik', rz, obj_R)
-        quats = utils.rotation_to_quaternion(
-            torch.from_numpy(composed))
+    # Compute ONLY the single Rz matrix for rot_index
+        r = rot_index * np.pi / 2
+        rz = np.array([[np.cos(r), -np.sin(r), 0.],
+                   [np.sin(r),  np.cos(r), 0.],
+                   [0.,         0.,        1.]], dtype=np.float32)
 
-        # Stay on CPU: lazy labels run inside DataLoader workers, and CUDA
-        # contexts per worker are too heavy (Windows spawn, VRAM sharing).
+        composed = rz @ obj_R  # (3, 3) matrix multiplication
+
+        # Add batch dim of 1 instead of 4
+        quats = utils.rotation_to_quaternion(torch.from_numpy(composed[None]))
+
         cats, _, _ = utils.quantize_quaternion_vertex(
             quats,
-            verts[None].expand(4, -1, -1).contiguous(),
-            vmask[None].expand(4, -1).contiguous(),
-            diam[None].expand(4).contiguous(),
-            vcorr[None].expand(4, -1, -1).contiguous(),
-            qsym[None].expand(4, -1, -1).contiguous(),
-            tsym[None].expand(4, -1, -1).contiguous(),
-            smask[None].expand(4, -1).contiguous())
-        return cats[rot_index].numpy()
+            verts[None],
+            vmask[None],
+            diam[None],
+            vcorr[None],
+            qsym[None],
+            tsym[None],
+            smask[None]
+        )
+
+
+        return cats[0].numpy()
