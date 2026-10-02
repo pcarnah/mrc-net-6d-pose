@@ -1,0 +1,88 @@
+// Dev container for MRC-Net 6-DoF pose estimation (usprobe / ycbv-ds).
+//
+// GPU: the CUDA base image supplies the CUDA 12.8 / cuDNN userland that matches
+//   the `torch==2.11.0` cu128 wheel and the prebuilt `pytorch3d==0.7.9+pt2110cu128`
+//   wheel in requirements.txt. `--gpus=all` passes the host GPU through, which
+//   requires the NVIDIA Container Toolkit (or Docker Desktop GPU support + WSL2).
+// Python/uv: uv is a dev container Feature and runs the repo's Linux install
+//   script (scripts/install_deps.sh), which creates .venv, installs
+//   requirements.txt and the sibling bop_toolkit. The Python Feature is only for
+//   editor/CLI tooling; uv provisions Python 3.13 for the venv itself.
+{
+	"name": "mrc-net-6d-pose (CUDA 12.8 + uv)",
+
+	// CUDA 12.8.1 + cuDNN devel on Ubuntu 24.04 (devel => nvcc is available).
+	"image": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04",
+
+	// Tooling added directly as dev container Features.
+	"features": {
+		// git, sudo, curl/ca-certificates and a non-root `vscode` user.
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"username": "vscode",
+			"installZsh": false,
+			"installOhMyZsh": false,
+			"configureZshAsDefaultShell": false,
+			"upgradePackages": false
+		},
+		// System CPython 3.13 for editor/debug tooling. `installTools: false`
+		// skips the bundled lint/format tools (the project has none).
+		"ghcr.io/devcontainers/features/python:1": {
+			"version": "3.13",
+			"installTools": false
+		},
+		// uv + uvx, used by scripts/install_deps.sh.
+		"ghcr.io/devcontainer-community/devcontainer-features/astral.sh-uv:1": {
+			"version": "latest"
+		},
+		"ghcr.io/devcontainers/features/node:1": {
+      		"version": "latest"
+    	}
+	},
+
+	// Pass the host NVIDIA GPU into the container.
+	"runArgs": [
+		"--device=nvidia.com/gpu=all",
+		"--shm-size=16g"
+	],
+
+	"mounts": [
+		// Keep the Linux venv in a volume so the bind-mounted Windows `.venv`
+		// in the repo is never touched, and the venv survives rebuilds.
+		"source=mrcnet-6d-pose-venv,target=${containerWorkspaceFolder}/.venv,type=volume",
+		"source=mrcnet-uv-cache,target=/home/vscode/.cache/uv,type=volume",
+		"source=mrcnet-kilo-cache,target=/home/vscode/.cache/kilo,type=volume",
+		"source=kilo-auth-cache,target=/home/vscode/.local/share/kilo,type=volume",
+  		"source=${localEnv:USERPROFILE}/.config/kilo,target=/home/vscode/.config/kilo,type=bind,consistency=cached",
+		"source=D:/6DPose/usprobe,target=${containerWorkspaceFolder}/../datasets/usprobe,type=bind,consistency=cached,readonly",
+		"source=D:/pcarnahanfiles/SteroOBJ-1M,target=${containerWorkspaceFolder}/../datasets/stereobj-1m,type=bind,consistency=cached,readonly",
+		"source=D:/YCB-V-DS,target=${containerWorkspaceFolder}/../datasets/ycbv-ds,type=bind,consistency=cached,readonly"
+		// ,"source=D:/6DPose,target=/mnt/d/6DPose,type=bind,consistency=cached"
+	],
+
+	// Put the venv first on PATH so `python` / `torchrun` in the repo scripts
+	// resolve to it even before the Python extension activates a terminal.
+	"remoteEnv": {
+		"PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
+	},
+
+	// The volume is created root-owned; hand it to `vscode`, then run the repo's
+	// Linux dependency script (creates .venv with Python 3.13, installs
+	// requirements.txt + ../bop_toolkit).
+	"postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cache/kilo /home/vscode/.local /home/vscode/.cache/uv /workspaces/mrc-net-6d-pose/.venv && bash scripts/install_devcontainer.sh",
+
+	"remoteUser": "vscode",
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"kilocode.kilo-code"
+			],
+			"settings": {
+				"python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python",
+				"python.terminal.activateEnvironment": true
+			}
+		}
+	}
+}

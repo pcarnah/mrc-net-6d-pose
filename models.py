@@ -380,6 +380,14 @@ class MRCNet(nn.Module):
         self.n_pose_bin = cfg.n_pose_bin
         self.use_6d = cfg.use_6d
 
+        # Two-view residual fusion. ``stereo_fuse`` concatenates the two
+        # views' ``reg_pool`` features (left first) and projects back to the
+        # mono regressor width; new parameters live only in ``stereo_fuse.*``
+        # so mono state_dicts stay bit-for-bit identical.
+        self.stereo_fusion = bool(getattr(cfg, 'stereo_fusion', False))
+        if self.stereo_fusion:
+            self.stereo_fuse = ConvGnReLU(4096, 2048, kernel_size=3, padding=1)
+
     def _make_predictions(self, mask_real, mask_synt, pose_logits,
                           depth_logits, trans_logits, pose_res,
                           depth_res, trans_res):
@@ -407,46 +415,86 @@ class MRCNet(nn.Module):
                        'translation': trans_persp}
         return predictions
 
-    def _refine_step(self, x_clf, R_cur, t_cur, aux, grad_ckpt=False):
+    def _render_and_match(self, x_clf_in, R_base, t_base, obj_cls,
+                          intrinsics, grad_ckpt=False):
+        """Render one view at ``(R_base, t_base)`` and run the weight-shared
+        synthetic backbone + decoder against that view's real features.
+
+        Returns ``(x_reg, mask_synt, render, render_map)``; ``x_reg`` is the
+        raw decoder feature dict (no ``fov`` yet).
+        """
+        with torch.no_grad():
+            out = self.renderer.render(
+                obj_cls, R_base, t_base,
+                [rendering.CameraView(K=intrinsics)])
+            render = out['rgb'][:, 0]
+            render_map = out['bbox_map'][:, 0]
+
+        sync_inputs = torch.concat([render, render_map], dim=1)
+
+        def synt_forward(sync_inputs, x_clf_arg):
+            x2, mask_synt = self.backbone(sync_inputs, obj_cls)
+            x_synt_in = torch.concat(
+                [x2, mask_synt.detach().sigmoid()], dim=1)
+            x_reg = self.decoder(x_clf_arg, x_synt_in)
+            return x_reg, mask_synt
+
+        if grad_ckpt:
+            x_reg, mask_synt = torch.utils.checkpoint.checkpoint(
+                synt_forward, sync_inputs, x_clf_in, use_reentrant=False)
+        else:
+            x_reg, mask_synt = synt_forward(sync_inputs, x_clf_in)
+        return x_reg, mask_synt, render, render_map
+
+    def _refine_step(self, x_clf, R_cur, t_cur, aux, grad_ckpt=False,
+                     x_clf_right=None):
         """One synthetic-branch forward for the current pose estimate.
 
         Renders ``(R_cur, t_cur)``, runs the weight-shared backbone and decoder
         on the synthetic/real feature pair and predicts the residual to compose
         on top of the current pose.  ``R_cur``/``t_cur`` are treated as a
         detached base: only the residuals carry gradient within a step.
+
+        When ``x_clf_right`` is given the right view is rendered at the
+        rig-composed pose and the two views' ``reg_pool`` features are fused
+        before the (unchanged) regressor; ``aux`` then carries
+        ``T_right_ref`` and ``intrinsics_right``.
         """
         R_base = R_cur.detach()
         t_base = t_cur.detach()
 
-        with torch.no_grad():
-            out = self.renderer.render(
-                aux['obj_cls'], R_base, t_base,
-                [rendering.CameraView(K=aux['intrinsics'])])
-            render = out['rgb'][:, 0]
-            render_map = out['bbox_map'][:, 0]
+        x_reg_left, mask_synt, render, render_map = self._render_and_match(
+            x_clf, R_base, t_base, aux['obj_cls'], aux['intrinsics'],
+            grad_ckpt=grad_ckpt)
 
-        sync_inputs = torch.concat([render, render_map], dim=1)
+        step = {'render': render, 'render_map': render_map,
+                'mask_synt': mask_synt}
 
-        def synt_forward(sync_inputs, x_clf_in):
-            x2, mask_synt = self.backbone(sync_inputs, aux['obj_cls'])
-            x_synt_in = torch.concat(
-                [x2, mask_synt.detach().sigmoid()], dim=1)
-            x_reg = self.decoder(x_clf_in, x_synt_in)
-            return x_reg, mask_synt
-
-        if grad_ckpt:
-            x_reg, mask_synt = torch.utils.checkpoint.checkpoint(
-                synt_forward, sync_inputs, x_clf, use_reentrant=False)
+        if x_clf_right is not None:
+            T = aux['T_right_ref'].to(torch.float32)
+            R_r = T[:, :3, :3] @ R_base
+            t_r = (T[:, :3, :3] @ t_base.unsqueeze(-1)).squeeze(-1) \
+                + T[:, :3, 3]
+            x_reg_right, mask_synt_right, render_right, render_map_right = \
+                self._render_and_match(
+                    x_clf_right, R_r, t_r, aux['obj_cls'],
+                    aux['intrinsics_right'], grad_ckpt=grad_ckpt)
+            reg_pool = self.stereo_fuse(torch.cat(
+                [x_reg_left['reg_pool'], x_reg_right['reg_pool']], dim=1))
+            x_reg = {'reg_pool': reg_pool}
+            step['render_right'] = render_right
+            step['render_map_right'] = render_map_right
+            step['mask_synt_right'] = mask_synt_right
         else:
-            x_reg, mask_synt = synt_forward(sync_inputs, x_clf)
+            x_reg = x_reg_left
 
         x_reg['fov'] = torch.concat([
             t_base[..., :2] / t_base[..., -1:],
             aux['fov'][..., 2:]], dim=1)
         pose_res, depth_res, trans_res = self.regressor(x_reg)
-        return {'render': render, 'render_map': render_map,
-                'mask_synt': mask_synt, 'pose_res': pose_res,
-                'depth_res': depth_res, 'trans_res': trans_res}
+        step.update({'pose_res': pose_res, 'depth_res': depth_res,
+                     'trans_res': trans_res})
+        return step
 
     def _compose_refine(self, step, R_cur, t_cur, aux, mask_real):
         """Compose one refinement residual onto the current pose estimate.
@@ -532,13 +580,35 @@ class MRCNet(nn.Module):
                 'REFINE_ITER_WEIGHTS has {} entries but '
                 'n_refine_iters={}'.format(len(weights), n_refine_iters))
 
-        # Classification bootstrap: unchanged, always iteration 0.
+        # Stereo is a fixed per-run property: the aux keys and the model's
+        # fusion layer must agree, otherwise the silent failure modes are
+        # confusing (random fusion / a missing view).
+        stereo = 'inputs_right' in aux
+        if stereo != self.stereo_fusion:
+            raise ValueError(
+                "stereo input/model mismatch: aux has inputs_right={} but "
+                "the model was built with stereo_fusion={}. Use a checkpoint "
+                "whose ModelConfig matches the dataset stereo_mode.".format(
+                    stereo, self.stereo_fusion))
+
+        # Classification bootstrap: unchanged, always mono left and always
+        # iteration 0. In stereo the right-eye real features are computed
+        # once and reused by every refinement iteration.
         x1, mask_real = self.backbone(inputs, aux['obj_cls'])
         x_real_in = torch.concat([x1, mask_real.detach().sigmoid()], dim=1)
         x_clf = self.decoder(x_real_in)
         x_clf['fov'] = aux['fov']
         pose_logits, depth_logits, trans_logits = self.classifier(x_clf)
         image_size = (cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE)
+
+        x_clf_right = None
+        if stereo:
+            x1r, mask_real_r = self.backbone(
+                aux['inputs_right'], aux['obj_cls'])
+            x_real_in_r = torch.concat(
+                [x1r, mask_real_r.detach().sigmoid()], dim=1)
+            x_clf_right = self.decoder(x_real_in_r)
+            x_clf_right['fov'] = aux['fov_right']
 
         with torch.no_grad():
             depth_id = torch.argmax(depth_logits, dim=-1)
@@ -570,7 +640,8 @@ class MRCNet(nn.Module):
         residual_mag = None
         for k in range(n_refine_iters):
             step = self._refine_step(
-                x_clf, R_cur, t_cur, aux, grad_ckpt=grad_ckpt)
+                x_clf, R_cur, t_cur, aux, grad_ckpt=grad_ckpt,
+                x_clf_right=x_clf_right)
             if k == 0:
                 predictions = self._make_predictions(
                     mask_real, step['mask_synt'], pose_logits, depth_logits,
@@ -578,6 +649,9 @@ class MRCNet(nn.Module):
                     step['trans_res'])
                 predictions['render'] = step['render']
                 predictions['mask_synt'] = step['mask_synt']
+                if stereo:
+                    predictions['render_right'] = step['render_right']
+                    predictions['mask_synt_right'] = step['mask_synt_right']
                 trans_2d_base = trans_xy
                 depth_id_base = depth_id
                 if targets:
@@ -591,6 +665,9 @@ class MRCNet(nn.Module):
                 predictions['quat_bin'] = pose_logits
                 predictions['depth_bin'] = depth_logits
                 predictions['trans_logits'] = trans_logits
+                if stereo:
+                    predictions['render_right'] = step['render_right']
+                    predictions['mask_synt_right'] = step['mask_synt_right']
                 trans_2d_base = predictions.pop('trans_2d_base')
                 depth_id_base = predictions.pop('depth_id_base')
                 if targets:

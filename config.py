@@ -29,8 +29,8 @@ POSE_SIGMA = 0.03  # standard deviation of quaternion bin distribution
 DEPTH_SIGMA = 0.5     # standard deviation of depth Gaussian distribution
 TRANS_SIGMA = 10 / INPUT_SIZE  # standard deviation of noise in 2D center
 
-DATASET_ROOT = "D:/6DPose"
-EVAL_ROOT = "D:/6DPose"
+DATASET_ROOT = "../datasets"
+EVAL_ROOT = "../datasets"
 # DATASET_ROOT = "/mnt/d/6DPose"
 # EVAL_ROOT = "/mnt/d/6DPose"
 VOC_BG_ROOT = "./data/VOCdevkit/VOC2012"
@@ -182,8 +182,14 @@ DATASET_CONFIG = {
         'val_set': ['val'],
         'test_set': ['val'],
         # 'mono': each eye is an independent scene (PoseSample stays
-        # single-view). 'stereo': reserved for the future two-view model.
-        'stereo_mode': 'mono',
+        # single-view). 'stereo': one sample per instance annotated on both
+        # eyes; __getitem__ returns the left-eye PoseSample plus the right-eye
+        # inputs (roi_image_right, bbox_map_right, roi_camK_right, fov_right)
+        # and the per-sample rig transform T_right_ref. Targets stay in the
+        # left-camera frame. Only the residual-regression branch fuses both
+        # views (stereo_fusion=True); the classification bootstrap stays mono.
+        'stereo_mode': 'stereo',
+        'stereo_fusion': True,
     },
     'usprobe': {
         'width': 1280,
@@ -248,6 +254,10 @@ class ModelConfig:
     use_6d: bool = USE_6D
     cell_size: int = CELL_SIZE
     input_img_size: int = INPUT_IMG_SIZE
+    # Two-view residual fusion (stereobj-1m stereo mode). Defaults to False so
+    # old checkpoint model_config dicts still construct and mono models keep a
+    # bit-for-bit identical state_dict.
+    stereo_fusion: bool = False
 
     @classmethod
     def from_dataset_config(cls, dataset):
@@ -257,4 +267,5 @@ class ModelConfig:
             n_decoders=dataset_cfg['num_class'],
             depth_min=dataset_cfg['Tz_near'],
             depth_max=dataset_cfg['Tz_far'],
-            n_depth_bin=Tz_BINS_NUM)
+            n_depth_bin=Tz_BINS_NUM,
+            stereo_fusion=dataset_cfg.get('stereo_fusion', False))

@@ -66,14 +66,25 @@ def main_worker(rank, world_size, args):
         pin_memory=True, num_workers=args.num_workers,
         drop_last=True, sampler=train_sampler)
 
-    model = models.MRCNet(model_config).to(rank)
+    model = models.MRCNet(model_config).to(rank).compile()
 
     if args.pretrained:
         checkpoint = torch.load(
             args.pretrained, map_location=torch.device(rank),
             weights_only=True)
         print('loading pre-trained model from {}'.format(args.pretrained))
-        model.load_state_dict(checkpoint['network'])
+        network = checkpoint['network']
+        has_fuse = any(k.startswith('stereo_fuse.') for k in network)
+        if model_config.stereo_fusion != has_fuse:
+            # Mono checkpoint -> stereo model (or vice versa): load the shared
+            # weights and leave/ignore the fusion parameters. Only reaches
+            # here for a deliberate cross-mode init; same-mode stays strict.
+            print('WARNING: checkpoint stereo_fuse={} does not match model '
+                  'stereo_fusion={}; loading non-strict'.format(
+                      has_fuse, model_config.stereo_fusion))
+            model.load_state_dict(network, strict=False)
+        else:
+            model.load_state_dict(network)
 
     if args.is_parallel:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -146,11 +157,26 @@ def main_worker(rank, world_size, args):
                 targets = {key: batch[key].to(rank, non_blocking=True)
                            for key in gpu_keys}
 
+                aux = {'obj_cls': targets['obj_cls'],
+                       'fov': targets['fov'],
+                       'intrinsics': targets['roi_camK']}
+                # Stereo datasets add the right-eye flat tensors via collate;
+                # the dataset mode guarantees they are all-or-none per batch.
+                if 'roi_image_right' in batch:
+                    batch_image_roi_right = torch.concat([
+                        batch['roi_image_right'].to(rank, non_blocking=True),
+                        batch['bbox_map_right'].to(rank, non_blocking=True)],
+                        dim=1)
+                    aux['inputs_right'] = batch_image_roi_right
+                    aux['intrinsics_right'] = batch['roi_camK_right'].to(
+                        rank, non_blocking=True)
+                    aux['fov_right'] = batch['fov_right'].to(
+                        rank, non_blocking=True)
+                    aux['T_right_ref'] = batch['T_right_ref'].to(
+                        rank, non_blocking=True)
+
                 predictions = model(
-                    batch_image_roi,
-                    {'obj_cls': targets['obj_cls'],
-                     'fov': targets['fov'],
-                     'intrinsics': targets['roi_camK']}, targets,
+                    batch_image_roi, aux, targets,
                     n_refine_iters=args.n_refine_iters,
                     grad_ckpt=args.refine_grad_ckpt)
                 loss_dict = predictions['losses']

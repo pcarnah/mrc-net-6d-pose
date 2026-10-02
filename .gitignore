@@ -178,6 +178,7 @@ output*/
 .virtual_documents/
 .kilo/
 .vscode/
+datasets/
 
 package-lock.json
 

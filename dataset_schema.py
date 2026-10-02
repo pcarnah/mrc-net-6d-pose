@@ -18,15 +18,31 @@ Layout (batch dimension added by the collate function):
         quat_bin   float32 (N_POSE_BIN,)
     meta (ints, never moved to the GPU as targets)
         obj_id, scene_id, image_id
+
+Optional stereo keys (only present when the adapter's ``stereo_mode`` is
+``'stereo'``; default collate stacks them alongside the flat tensors above):
+
+    roi_image_right  float32 (3, H, W)  right-eye crop (same crop pipeline)
+    bbox_map_right   float32 (1, H, W)  right-eye DZI bbox map
+    roi_camK_right   float32 (3, 3)     right-eye crop intrinsics
+    fov_right        float32 (3,)       right-eye field-of-view descriptor
+    T_right_ref      float32 (4, 4)     rig transform left -> right frame,
+                                        ``[I | -Rz @ (b, 0, 0)]`` under the
+                                        shared Rz crop augmentation
+
+Targets stay left-frame only; ``T_right_ref`` is applied by the model to the
+left-frame pose estimate. See ``stereobj_dataset`` for the convention.
 """
 from abc import ABC, abstractmethod
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import torch
 
 INPUT_KEYS = ['roi_image', 'bbox_map', 'roi_camK', 'fov', 'obj_cls']
 TARGET_KEYS = ['roi_obj_R', 'roi_obj_t', 'roi_mask', 'quat_bin']
 META_KEYS = ['obj_id', 'scene_id', 'image_id']
+STEREO_KEYS = ['roi_image_right', 'bbox_map_right', 'roi_camK_right',
+               'fov_right', 'T_right_ref']
 
 
 class PoseSample(TypedDict):
@@ -45,6 +61,12 @@ class PoseSample(TypedDict):
     obj_id: int
     scene_id: int
     image_id: int
+    # optional stereo inputs (see module docstring)
+    roi_image_right: NotRequired[torch.Tensor]
+    bbox_map_right: NotRequired[torch.Tensor]
+    roi_camK_right: NotRequired[torch.Tensor]
+    fov_right: NotRequired[torch.Tensor]
+    T_right_ref: NotRequired[torch.Tensor]
 
 
 class PoseDataset(ABC):

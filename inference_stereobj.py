@@ -1,10 +1,12 @@
-"""GT-detection inference on stereobj-1m (val split).
+"""GT-detection stereo inference on stereobj-1m (val split).
 
-Mirrors ``inference_bop.py`` but reads instances through the
-``StereobjDataset`` webdataset index: for every annotated (frame, eye,
-instance) the GT bbox seeds the 4-way Rz crop batch and the predicted
-pose is written as a BOP-format CSV (scene_id encodes frame*2+eye, so
-poses stay attributable per eye for mono-mode evaluation).
+Reads instances annotated on both eyes through the ``StereobjDataset``
+webdataset index. For every such (frame, instance) the left and right GT
+bboxes seed matching 4-way Rz crop batches (same ``rot_index`` sequence) and
+the model's stereo-fusion path predicts the pose in the left-camera frame,
+written as a BOP-format CSV (``scene_id = 2*frame``). Requires
+``stereo_mode='stereo'`` in ``DATASET_CONFIG`` and a checkpoint built with
+``stereo_fusion=True``; a mismatched model/dataset fails loudly.
 """
 import argparse
 import json
@@ -38,7 +40,8 @@ def timed(fn):
     return result, start.elapsed_time(end) / 1000
 
 
-def make_warmup_batch():
+def make_warmup_batch(stereo=False):
+    """Keyword args for a dummy 4-hypothesis ``inference_func`` call."""
     n = 4
     size = bop_cfg.INPUT_IMG_SIZE
     roi_rgb = np.zeros((n, 3, size, size), dtype=np.float32)
@@ -52,7 +55,17 @@ def make_warmup_batch():
     fov = np.zeros((n, 3), dtype=np.float32)
     fov[:, 2] = 0.625
     Rz = np.tile(np.eye(3, dtype=np.float32), (n, 1, 1))
-    return obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz
+    warmup = {'obj_cls': obj_cls, 'roi_rgb': roi_rgb, 'bbox_loc': bbox_loc,
+              'roi_camK': roi_camK, 'fov': fov, 'Rz': Rz}
+    if stereo:
+        warmup.update({
+            'roi_rgb_right': roi_rgb.copy(),
+            'bbox_loc_right': bbox_loc.copy(),
+            'roi_camK_right': roi_camK.copy(),
+            'fov_right': fov.copy(),
+            'T_right_ref': np.tile(np.eye(4, dtype=np.float32), (n, 1, 1)),
+        })
+    return warmup
 
 
 def build_rz_crop_batch(view_image, view_cam_K, det_bbox, box_scale,
@@ -112,7 +125,9 @@ def build_rz_crop_batch(view_image, view_cam_K, det_bbox, box_scale,
 
 
 def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
-                   n_refine_iters=1, refine_stop_thresh=0.0):
+                   n_refine_iters=1, refine_stop_thresh=0.0,
+                   roi_rgb_right=None, bbox_loc_right=None,
+                   roi_camK_right=None, fov_right=None, T_right_ref=None):
     batch_image = torch.from_numpy(roi_rgb).to(device)
     batch_obj_cls = torch.from_numpy(obj_cls).to(device)
     im_height, im_width = batch_image.shape[2:]
@@ -124,11 +139,25 @@ def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
     batch_input = torch.cat([batch_image, batch_bbox_map], dim=1)
     intrinsics = torch.from_numpy(roi_camK).to(device)
 
+    aux = {'obj_cls': batch_obj_cls,
+           'fov': batch_fov,
+           'intrinsics': intrinsics}
+    if roi_rgb_right is not None:
+        batch_image_r = torch.from_numpy(roi_rgb_right).to(device)
+        batch_bbox_map_r = torch.stack([utils.make_roi(
+            torch.as_tensor(x, dtype=torch.float32), im_height).to(device)
+            for x in bbox_loc_right], dim=0).unsqueeze(1)
+        aux['inputs_right'] = torch.cat([batch_image_r, batch_bbox_map_r],
+                                        dim=1)
+        aux['intrinsics_right'] = torch.from_numpy(
+            roi_camK_right).to(device)
+        aux['fov_right'] = torch.as_tensor(
+            fov_right, dtype=torch.float32).to(device)
+        aux['T_right_ref'] = torch.as_tensor(
+            T_right_ref, dtype=torch.float32).to(device)
+
     with torch.no_grad():
-        predictions = net(batch_input,
-                          {'obj_cls': batch_obj_cls,
-                           'fov': batch_fov,
-                           'intrinsics': intrinsics},
+        predictions = net(batch_input, aux,
                           n_refine_iters=n_refine_iters,
                           refine_stop_thresh=refine_stop_thresh)
         R_conf = predictions['quat_bin']
@@ -187,15 +216,25 @@ if __name__ == '__main__':
     net = models.MRCNet(model_config).to(device)
     print('building model for {}'.format(p['dataset']))
     print('loading pre-trained model from {}'.format(p['checkpoint']))
-    net.load_state_dict(checkpoint['network'])
+    network = checkpoint['network']
+    has_fuse = any(k.startswith('stereo_fuse.') for k in network)
+    if model_config.stereo_fusion != has_fuse:
+        print('WARNING: checkpoint stereo_fuse={} does not match model '
+              'stereo_fusion={}; loading non-strict (fusion is random)'.format(
+                  has_fuse, model_config.stereo_fusion))
+        net.load_state_dict(network, strict=False)
+    else:
+        net.load_state_dict(network)
     net.eval()
 
     if args.no_compile:
         print('skipping torch.compile (--no_compile)')
     else:
+        stereo_model = net.stereo_fusion
         net = torch.compile(net)
         try:
-            inference_func(net, device, *make_warmup_batch(),
+            inference_func(net, device,
+                           **make_warmup_batch(stereo=stereo_model),
                            n_refine_iters=args.n_refine_iters,
                            refine_stop_thresh=0.0)
             print('torch.compile warm-up succeeded.')
@@ -205,102 +244,118 @@ if __name__ == '__main__':
             net = net._orig_mod
 
     dataset = dataset_factory.create_dataset(p['dataset'], split=args.split)
+    if getattr(dataset, 'stereo_mode', 'mono') != 'stereo':
+        raise SystemExit(
+            "inference_stereobj.py needs dataset {} stereo_mode='stereo' "
+            "(got {!r})".format(p['dataset'],
+                                getattr(dataset, 'stereo_mode', 'mono')))
     est_pose_file = '{}/mrcnet_{}-{}_{}.csv'.format(
         p['eval_root'], p['dataset'], args.split, p['output_suffix_name'])
 
-    # Group the flat index by (frame, eye): one image load serves all its
-    # instances.
-    image_groups = {}
-    for idx in range(len(dataset)):
-        fi = int(np.searchsorted(dataset._offsets, idx, side='right') - 1)
-        off = idx - dataset._offsets[fi]
-        frame = dataset.frame_records[fi]
-        seen = 0
-        for inst in frame['instances']:
-            for eye_i, eye in enumerate(dataset.EYE_KEYS):
-                if inst['sides'] & (1 << eye_i):
-                    if seen == off:
-                        key = (fi, eye)
-                        image_groups.setdefault(key, []).append(
-                            (idx, inst, eye))
-                    seen += 1
-
-    print('Evaluation on {}: {} instances in {} images'.format(
-        p['dataset'], len(dataset), len(image_groups)))
+    # Group instances annotated on both eyes by frame; one webp/json load per
+    # frame serves all its stereo instances.
+    frame_rows = {}
+    for row in range(len(dataset._i_frame)):
+        if int(dataset._i_sides[row]) == 0b11:
+            frame_rows.setdefault(int(dataset._i_frame[row]), []).append(row)
+    n_inst = sum(len(v) for v in frame_rows.values())
+    print('Evaluation on {}: {} stereo instances in {} images'.format(
+        p['dataset'], n_inst, len(frame_rows)))
     print(est_pose_file)
 
+    import cv2
+    import json
+    import tarfile
+
+    baseline = dataset.baseline
+    stop_thresh = (args.refine_stop_thresh
+                   if args.n_refine_iters > 1 else 0.0)
     pose_results = []
-    eval_steps = 0
-    view_runtime = []
-    for (fi, eye), entries in tqdm(sorted(image_groups.items()),
-                                   desc='images', unit='img'):
-        frame = dataset.frame_records[fi]
-        x_off = dataset.EYE_W if eye == 'right' else 0
-        import tarfile
-        with tarfile.open(frame['shard'], 'r') as tar:
+    for fi, rows in tqdm(sorted(frame_rows.items()),
+                         desc='images', unit='img'):
+        shard = dataset._shard_paths[int(dataset._f_shard[fi])]
+        with tarfile.open(shard, 'r') as tar:
             webp_buf = dataset._read_member(
-                tar, frame['webp_offset'], frame['webp_size'])
-        import cv2
+                tar, int(dataset._f_webp_offset[fi]),
+                int(dataset._f_webp_size[fi]))
+            label = json.loads(dataset._read_member(
+                tar, int(dataset._f_json_offset[fi]),
+                int(dataset._f_json_size[fi])).decode('utf-8'))
         img_pair = cv2.imdecode(
             np.frombuffer(webp_buf, np.uint8), cv2.IMREAD_COLOR)
-        view_image = torch.as_tensor(
-            np.ascontiguousarray(img_pair[:, x_off:x_off + dataset.EYE_W]),
+        left_image = torch.as_tensor(
+            np.ascontiguousarray(img_pair[:, :dataset.EYE_W]),
             dtype=torch.float32)
-        img_H, img_W = view_image.shape[:2]
-        view_cam_K = dataset.eye_intrinsics(eye)
-        fx, fy = view_cam_K[0, 0], view_cam_K[1, 1]
-        cx0, cy0 = view_cam_K[0, 2], view_cam_K[1, 2]
+        right_image = torch.as_tensor(
+            np.ascontiguousarray(
+                img_pair[:, dataset.EYE_W:2 * dataset.EYE_W]),
+            dtype=torch.float32)
+        img_H, img_W = left_image.shape[:2]
+        K_left = dataset.eye_intrinsics('left')
+        K_right = dataset.eye_intrinsics('right')
+        fx_l, fy_l = K_left[0, 0], K_left[1, 1]
+        fx_r, fy_r = K_right[0, 0], K_right[1, 1]
 
         inst_time = []
-        view_objs = []
-        for idx, inst, _ in entries:
-            import json
-            with tarfile.open(frame['shard'], 'r') as tar:
-                label = json.loads(dataset._read_member(
-                    tar, frame['json_offset'],
-                    frame['json_size']).decode('utf-8'))
-            bb = label['scaled_bboxes'][eye][inst['obj_key']]
-            x1 = bb['x_min'] - x_off
-            x2 = bb['x_max'] - x_off
-            y1, y2 = bb['y_min'], bb['y_max']
-            cx = min((x1 + x2) / 2.0, img_W)
-            cy = min((y1 + y2) / 2.0, img_H)
-            bw = int(max(0, min(x2 - x1, img_W)))
-            bh = int(max(0, min(y2 - y1, img_H)))
-            box_scale = max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE
-
+        frame_objs = []
+        for row in rows:
+            obj_key = 'Object {}'.format(int(dataset._i_mask[row]) - 1)
             inst_cls = torch.as_tensor(
-                dataset_id2cls[inst['obj_name']], dtype=torch.int64)
+                int(dataset._i_cls[row]), dtype=torch.int64)
+            inst_name = dataset.cls_names[int(dataset._i_cls[row])]
+
+            def eye_box(eye, x_off):
+                bb = label['scaled_bboxes'][eye][obj_key]
+                x1 = bb['x_min'] - x_off
+                x2 = bb['x_max'] - x_off
+                y1, y2 = bb['y_min'], bb['y_max']
+                cx = min((x1 + x2) / 2.0, img_W)
+                cy = min((y1 + y2) / 2.0, img_H)
+                bw = int(max(0, min(x2 - x1, img_W)))
+                bh = int(max(0, min(y2 - y1, img_H)))
+                return (x1, y1, x2, y2), max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE, \
+                    cx, cy
+
+            box_l, scale_l, cx_l, cy_l = eye_box('left', 0)
+            box_r, scale_r, cx_r, cy_r = eye_box('right', dataset.EYE_W)
+
             inst_timer = time.time()
             b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
-                build_rz_crop_batch(view_image, view_cam_K,
-                                    (x1, y1, x2, y2), box_scale, cx, cy,
-                                    fx, fy, dataset_id2cls, inst_cls)
-            stop_thresh = (args.refine_stop_thresh
-                           if args.n_refine_iters > 1 else 0.0)
-            (est_R, est_t), run_time = timed(lambda: inference_func(
+                build_rz_crop_batch(
+                    left_image, K_left, box_l, scale_l, cx_l, cy_l,
+                    fx_l, fy_l, dataset_id2cls, inst_cls)
+            _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
+                build_rz_crop_batch(
+                    right_image, K_right, box_r, scale_r, cx_r, cy_r,
+                    fx_r, fy_r, dataset_id2cls, inst_cls)
+            T_right_ref = np.tile(np.eye(4, dtype=np.float32), (4, 1, 1))
+            T_right_ref[:, :3, 3] = -np.einsum(
+                'nij,j->ni', b_Rz,
+                np.array([baseline, 0.0, 0.0], dtype=np.float32))
+
+            (est_R, est_t), _run_time = timed(lambda: inference_func(
                 net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
                 b_roi_camK, b_fov, b_Rz,
                 n_refine_iters=args.n_refine_iters,
-                refine_stop_thresh=stop_thresh))
+                refine_stop_thresh=stop_thresh,
+                roi_rgb_right=r_roi_rgb, bbox_loc_right=r_bbox_loc,
+                roi_camK_right=r_roi_camK, fov_right=r_fov,
+                T_right_ref=T_right_ref))
             inst_time.append(time.time() - inst_timer)
-            view_objs.append((inst, est_R, est_t))
+            frame_objs.append((inst_name, est_R, est_t))
 
         view_cost = np.sum(inst_time) if inst_time else 0.0
-        view_runtime.append(view_cost)
-        for inst, est_R, est_t in view_objs:
+        for inst_name, est_R, est_t in frame_objs:
             pose_results.append({
                 'time': view_cost,
-                # BOP im_id: frame index within the split; scene_id also
-                # encodes the eye (2*scene + eye) for mono-mode eval.
-                'scene_id': int(frame['scene_id']) * 2 + dataset.EYE_KEYS.index(eye),
-                'im_id': int(frame['key'].rsplit('_', 1)[1]),
-                'obj_id': dataset_id2cls[inst['obj_name']] + 1,
+                # scene_id encodes the frame; poses are left-frame.
+                'scene_id': int(dataset._f_scene_id[fi]) * 2,
+                'im_id': int(dataset._f_image_id[fi]),
+                'obj_id': dataset_id2cls[inst_name] + 1,
                 'score': 1.0,
                 'R': est_R,
                 't': est_t,
             })
-        eval_steps += 1
         if args.max_instances and len(pose_results) >= args.max_instances:
             break
 

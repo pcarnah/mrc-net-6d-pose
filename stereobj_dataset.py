@@ -32,10 +32,13 @@ Modes:
            as ``BOP_Dataset`` (single view, left-frame pose). The right
            eye composes its own pose R, t - [b, 0, 0] in its own camera
            frame.
-    stereo reserved for the two-view model: ``__getitem__`` returns both
-           eyes' inputs plus the per-eye poses (see ``PoseSample`` note
-           in dataset_schema); the training loop for this mode is not
-           implemented yet.
+    stereo one sample per instance annotated on both eyes. ``__getitem__``
+           returns the left-eye PoseSample (targets = left Rz-composed
+           pose) plus the right-eye crop inputs and the per-sample rig
+           transform ``T_right_ref = [I | -Rz @ (b, 0, 0)]`` (see
+           ``PoseSample`` in dataset_schema). Both eyes share the same Rz
+           crop-augmentation index; photometric and DZI augmentation stay
+           per-eye independent.
 """
 import io
 import os
@@ -57,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 cv2.setNumThreads(0)
 
-SCHEMA_VERSION = 'stereobj-v1'
+SCHEMA_VERSION = 'stereobj-v2'
 
 # camera.json projection matrix was defined on this canvas; the webds
 # converter resized it to (WEBDS_W, WEBDS_H).
@@ -153,8 +156,8 @@ class StereobjDataset(PoseDataset):
 
         mono:   one sample per (instance, annotated eye); each eye is an
                 independent scene.
-        stereo: one sample per instance annotated on both eyes; reserved
-                for the two-view model (raises in __getitem__).
+        stereo: one sample per instance annotated on both eyes; both-eye
+                inputs are returned by read_data_stereo.
         """
         n_frames = len(self.frame_records)
 
@@ -252,14 +255,12 @@ class StereobjDataset(PoseDataset):
         return self._n_samples
 
     def __getitem__(self, idx):
-        if self.stereo_mode != 'mono':
-            raise NotImplementedError(
-                "stereo mode is scaffolded but the two-view model is not "
-                "implemented; use stereo_mode='mono'")
         fi = int(np.searchsorted(self._offsets, idx, side='right') - 1)
         off = idx - self._offsets[fi]
         packed = int(self._frame_rows[self._frame_row_start[fi] + off])
         row, eye_i = packed >> 1, packed & 1
+        if self.stereo_mode == 'stereo':
+            return self.read_data_stereo(fi, row)
         return self.read_data(fi, row, EYE_KEYS[eye_i])
 
     # ------------------------------------------------------------------ #
@@ -422,12 +423,10 @@ class StereobjDataset(PoseDataset):
         tar.fileobj.seek(offset)
         return tar.fileobj.read(size)
 
-    def read_data(self, fi, row, eye):
-        """Load one (frame, instance, eye) and build a PoseSample dict."""
+    def _load_frame_arrays(self, fi):
+        """Read the label json, stereo webp pair and mask for one frame."""
         import json
-        x_off = EYE_W if eye == 'right' else 0
         shard = self._shard_paths[self._f_shard[fi]]
-
         with tarfile.open(shard, 'r') as tar:
             label = json.loads(self._read_member(
                 tar, self._f_json_offset[fi],
@@ -439,13 +438,22 @@ class StereobjDataset(PoseDataset):
 
         img_pair = cv2.imdecode(
             np.frombuffer(webp_buf, np.uint8), cv2.IMREAD_COLOR)  # BGR
+        mask_full = cv2.imdecode(
+            np.frombuffer(mask_buf, np.uint8), cv2.IMREAD_UNCHANGED)
+        return label, img_pair, mask_full
+
+    def _read_eye(self, fi, row, eye, label, img_pair, mask_full, rot_index):
+        """Crop/augment one eye and return its inputs plus Rz-composed pose.
+
+        ``rot_index=None`` draws the Rz crop-augmentation index at the
+        original point in the RNG stream (mono path); stereo passes one
+        shared index so both eyes rotate consistently.
+        """
+        x_off = EYE_W if eye == 'right' else 0
         image = np.ascontiguousarray(img_pair[:, x_off:x_off + EYE_W])
         im_H, im_W = image.shape[:2]
 
-        mask_full = cv2.imdecode(
-            np.frombuffer(mask_buf, np.uint8), cv2.IMREAD_UNCHANGED)
         mask_full = np.ascontiguousarray(mask_full[:, x_off:x_off + EYE_W])
-
         cam_K = self.eye_intrinsics(eye)
 
         # Pose: json rt is in the left-camera frame. The right camera sits
@@ -464,7 +472,6 @@ class StereobjDataset(PoseDataset):
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
         obj_key = 'Object {}'.format(self._i_mask[row] - 1)
-        obj_name = self.cls_names[self._i_cls[row]]
         bbox_entry = label['scaled_bboxes'][eye][obj_key]
         x1 = bbox_entry['x_min'] - x_off
         x2 = bbox_entry['x_max'] - x_off
@@ -498,8 +505,9 @@ class StereobjDataset(PoseDataset):
             bbox_loc = np.array([0.5 - wr/2, 0.5 - hr/2,
                                  0.5 + wr/2, 0.5 + hr/2])
 
-        rot_index = (np.random.randint(4)
-                     if self.split in ('train', 'finetune') else 0)
+        if rot_index is None:
+            rot_index = (np.random.randint(4)
+                         if self.split in ('train', 'finetune') else 0)
         rot_rad = rot_index * np.pi / 2
         Rz = np.array([[np.cos(rot_rad), -np.sin(rot_rad), 0.0],
                        [np.sin(rot_rad), np.cos(rot_rad), 0.0],
@@ -538,23 +546,80 @@ class StereobjDataset(PoseDataset):
             torch.as_tensor(bbox_loc, dtype=torch.float32),
             self.rgb_size).unsqueeze(0)
 
-        quat_bin = self._compute_quat_bin(obj_name, R, rot_index)
-
         return {
             'roi_image': torch.as_tensor(roi_img, dtype=torch.float32).contiguous(),
             'bbox_map': torch.as_tensor(bbox_map, dtype=torch.float32),
             'roi_camK': torch.as_tensor(roi_camK, dtype=torch.float32).squeeze(),
             'fov': torch.as_tensor(fov, dtype=torch.float32),
-            'obj_cls': torch.as_tensor(int(self._i_cls[row]), dtype=torch.int64),
-            'roi_obj_R': torch.as_tensor(R, dtype=torch.float32),
-            'roi_obj_t': torch.as_tensor(t, dtype=torch.float32),
             'roi_mask': torch.as_tensor(roi_mask, dtype=torch.float32).contiguous(),
+            'R': R,
+            't': t,
+            'rot_index': rot_index,
+        }
+
+    def _assemble_sample(self, fi, row, eye, eye_out, quat_bin):
+        """Build the left-frame PoseSample dict from one eye's crop output."""
+        return {
+            'roi_image': eye_out['roi_image'],
+            'bbox_map': eye_out['bbox_map'],
+            'roi_camK': eye_out['roi_camK'],
+            'fov': eye_out['fov'],
+            'obj_cls': torch.as_tensor(int(self._i_cls[row]), dtype=torch.int64),
+            'roi_obj_R': torch.as_tensor(eye_out['R'], dtype=torch.float32),
+            'roi_obj_t': torch.as_tensor(eye_out['t'], dtype=torch.float32),
+            'roi_mask': eye_out['roi_mask'],
             'quat_bin': torch.as_tensor(quat_bin, dtype=torch.float32),
             # numeric object id (class index + 1), mirroring BOP ids
             'obj_id': int(self._i_cls[row]) + 1,
             'scene_id': int(self._f_scene_id[fi]) * 2 + EYE_KEYS.index(eye),
             'image_id': int(self._f_image_id[fi]),
         }
+
+    def read_data(self, fi, row, eye):
+        """Load one (frame, instance, eye) and build a mono PoseSample dict."""
+        label, img_pair, mask_full = self._load_frame_arrays(fi)
+        eye_out = self._read_eye(
+            fi, row, eye, label, img_pair, mask_full, None)
+        obj_name = self.cls_names[self._i_cls[row]]
+        quat_bin = self._compute_quat_bin(obj_name, eye_out['R'],
+                                          eye_out['rot_index'])
+        return self._assemble_sample(fi, row, eye, eye_out, quat_bin)
+
+    def read_data_stereo(self, fi, row):
+        """Build a stereo PoseSample: left-eye targets + right-eye inputs.
+
+        Both eyes share one Rz crop index; the returned left-frame targets
+        are the left-eye Rz-composed pose. The rig transform is
+        ``T_right_ref = [I | -Rz @ (b, 0, 0)]``.
+        """
+        label, img_pair, mask_full = self._load_frame_arrays(fi)
+        rot_index = (np.random.randint(4)
+                     if self.split in ('train', 'finetune') else 0)
+        left = self._read_eye(
+            fi, row, 'left', label, img_pair, mask_full, rot_index)
+        right = self._read_eye(
+            fi, row, 'right', label, img_pair, mask_full, rot_index)
+
+        obj_name = self.cls_names[self._i_cls[row]]
+        quat_bin = self._compute_quat_bin(obj_name, left['R'], rot_index)
+        sample = self._assemble_sample(fi, row, 'left', left, quat_bin)
+
+        rot_rad = rot_index * np.pi / 2
+        Rz = np.array([[np.cos(rot_rad), -np.sin(rot_rad), 0.0],
+                       [np.sin(rot_rad), np.cos(rot_rad), 0.0],
+                       [0.0, 0.0, 1.0]], dtype=np.float32)
+        T_right_ref = np.eye(4, dtype=np.float32)
+        T_right_ref[:3, 3] = -Rz @ np.array(
+            [self.baseline, 0.0, 0.0], dtype=np.float32)
+
+        sample.update({
+            'roi_image_right': right['roi_image'],
+            'bbox_map_right': right['bbox_map'],
+            'roi_camK_right': right['roi_camK'],
+            'fov_right': right['fov'],
+            'T_right_ref': torch.as_tensor(T_right_ref, dtype=torch.float32),
+        })
+        return sample
 
     # ------------------------------------------------------------------ #
     # Quaternion labels (lazy; stereobj-1m is far too large to precompute)
