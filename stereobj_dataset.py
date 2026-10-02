@@ -94,6 +94,7 @@ class StereobjDataset(PoseDataset):
 
         self.width = ds_cfg['width']
         self.height = ds_cfg['height']
+        self.EYE_W = EYE_W
         self.depth_min = ds_cfg['Tz_near']
         self.depth_max = ds_cfg['Tz_far']
         self.num_objects = ds_cfg['num_class']
