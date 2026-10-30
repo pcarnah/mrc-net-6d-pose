@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 INPUT_SIZE = 256
@@ -41,11 +42,38 @@ POSE_SIGMA = 0.03  # standard deviation of quaternion bin distribution
 DEPTH_SIGMA = 0.5     # standard deviation of depth Gaussian distribution
 TRANS_SIGMA = 10 / INPUT_SIZE  # standard deviation of noise in 2D center
 
-DATASET_ROOT = "../datasets"
-EVAL_ROOT = "../datasets"
+def _env_path(name, default):
+    """Root path from ``MRC_<NAME>`` / ``<NAME>`` env vars, else ``default``.
+
+    Lets a cluster job point the data/eval roots at a staging dir (e.g.
+    ``$SLURM_TMPDIR``) without editing this file.
+    """
+    return os.environ.get('MRC_' + name, os.environ.get(name, default))
+
+
+DATASET_ROOT = _env_path('DATASET_ROOT', '../datasets')
+# EVAL_ROOT follows DATASET_ROOT unless overridden explicitly.
+EVAL_ROOT = os.environ.get(
+    'MRC_EVAL_ROOT', os.environ.get('EVAL_ROOT', DATASET_ROOT))
 # DATASET_ROOT = "/mnt/d/6DPose"
 # EVAL_ROOT = "/mnt/d/6DPose"
-VOC_BG_ROOT = "./data/VOCdevkit/VOC2012"
+VOC_BG_ROOT = _env_path('VOC_BG_ROOT', './data/VOCdevkit/VOC2012')
+
+
+def set_roots(dataset_root=None, eval_root=None):
+    """Override the dataset/eval roots for this process (CLI ``--dataset_root``
+    / ``--eval_root``).  Values are also exported to ``MRC_DATASET_ROOT`` /
+    ``MRC_EVAL_ROOT`` so spawned DataLoader workers and child processes see the
+    same roots.  Returns ``(DATASET_ROOT, EVAL_ROOT)``.
+    """
+    global DATASET_ROOT, EVAL_ROOT
+    if dataset_root is not None:
+        DATASET_ROOT = dataset_root
+        os.environ['MRC_DATASET_ROOT'] = dataset_root
+    if eval_root is not None:
+        EVAL_ROOT = eval_root
+        os.environ['MRC_EVAL_ROOT'] = eval_root
+    return DATASET_ROOT, EVAL_ROOT
 
 END_LR = 5e-6
 START_LR = 2e-4

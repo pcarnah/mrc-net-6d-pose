@@ -208,8 +208,15 @@ if __name__ == '__main__':
     parser.add_argument('--no_compile', action='store_true')
     parser.add_argument('--max_instances', type=int, default=0,
                         help='debug cap on the number of instances (0 = all)')
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='override config.DATASET_ROOT (default: env '
+                             'MRC_DATASET_ROOT / DATASET_ROOT, else config)')
+    parser.add_argument('--eval_root', type=str, default=None,
+                        help='override config.EVAL_ROOT (default: env '
+                             'MRC_EVAL_ROOT / EVAL_ROOT, else DATASET_ROOT)')
     args = parser.parse_args()
 
+    bop_cfg.set_roots(args.dataset_root, args.eval_root)
     bop_cfg.set_runtime_overrides(
         args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion)
     init_pose_noise = (args.init_rot_noise_deg, args.init_trans_noise)

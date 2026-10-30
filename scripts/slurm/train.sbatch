@@ -30,6 +30,7 @@
 #   EXTRA_ARGS   extra main.py flags (e.g. --no_compile)    []
 #   MRC_VENV     path to a venv to activate (optional)      []
 #   MRC_CONDA_ENV  conda env name to activate (optional)    []
+#   DATASET_ROOT / EVAL_ROOT  data/eval roots; default $SLURM_TMPDIR  []
 
 set -euo pipefail
 
@@ -42,6 +43,14 @@ fi
 if [ -n "${MRC_CONDA_ENV:-}" ]; then
   eval "$(conda shell.bash hook)"
   conda activate "${MRC_CONDA_ENV}"
+fi
+
+# Data/eval roots: an explicit MRC_* / DATASET_ROOT / EVAL_ROOT wins, else use
+# the per-job staging dir $SLURM_TMPDIR when present.  (config.py also accepts
+# --dataset_root / --eval_root on the command line.)
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+  export MRC_DATASET_ROOT="${MRC_DATASET_ROOT:-${DATASET_ROOT:-$SLURM_TMPDIR}}"
+  export MRC_EVAL_ROOT="${MRC_EVAL_ROOT:-${EVAL_ROOT:-$SLURM_TMPDIR}}"
 fi
 
 RUN_NAME="${RUN_NAME:-mrcnet}"

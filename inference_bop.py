@@ -207,7 +207,15 @@ if __name__ == '__main__':
     parser.add_argument('--no_compile', action='store_true',
                         help='run the network eagerly instead of '
                              'torch.compile(net)')
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='override config.DATASET_ROOT (default: env '
+                             'MRC_DATASET_ROOT / DATASET_ROOT, else config)')
+    parser.add_argument('--eval_root', type=str, default=None,
+                        help='override config.EVAL_ROOT (default: env '
+                             'MRC_EVAL_ROOT / EVAL_ROOT, else DATASET_ROOT)')
     args = parser.parse_args()
+
+    bop_cfg.set_roots(args.dataset_root, args.eval_root)
 
     p = {
         'dataset': args.dataset,

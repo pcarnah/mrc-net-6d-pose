@@ -25,6 +25,7 @@
 #   INIT_TRANS_NOISE bootstrap translation noise (frac)      [0]
 #   EVAL           1 to run tools/eval_stereobj.py after     [1]
 #   EXTRA_ARGS     extra inference flags (e.g. --no_compile) []
+#   DATASET_ROOT / EVAL_ROOT  data/eval roots; default $SLURM_TMPDIR  []
 
 set -euo pipefail
 
@@ -37,6 +38,14 @@ fi
 if [ -n "${MRC_CONDA_ENV:-}" ]; then
   eval "$(conda shell.bash hook)"
   conda activate "${MRC_CONDA_ENV}"
+fi
+
+# Data/eval roots: explicit MRC_* / DATASET_ROOT / EVAL_ROOT wins, else the
+# per-job staging dir $SLURM_TMPDIR.  config.py also accepts --dataset_root /
+# --eval_root on the command line.
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+  export MRC_DATASET_ROOT="${MRC_DATASET_ROOT:-${DATASET_ROOT:-$SLURM_TMPDIR}}"
+  export MRC_EVAL_ROOT="${MRC_EVAL_ROOT:-${EVAL_ROOT:-$SLURM_TMPDIR}}"
 fi
 
 RUN_NAME="${RUN_NAME:-mrcnet}"
@@ -72,7 +81,7 @@ python inference_stereobj.py \
 if [ "$EVAL" = "1" ]; then
   # inference_stereobj.py writes
   #   <EVAL_ROOT>/mrcnet_<dataset>-<split>_<checkpoint_name>_<suffix>.csv
-  EVAL_ROOT="${EVAL_ROOT:-$(python -c 'import config; print(config.EVAL_ROOT)')}"
+  EVAL_ROOT="${EVAL_ROOT:-${MRC_EVAL_ROOT:-$(python -c 'import config; print(config.EVAL_ROOT)')}}"
   CSV="${EVAL_ROOT}/mrcnet_${DATASET}-${SPLIT}_${CHKPT_NAME}_${SUFFIX}.csv"
   OUT="reports/${RUN_NAME}_${SUFFIX}.eval.json"
   mkdir -p reports

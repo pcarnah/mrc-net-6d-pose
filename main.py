@@ -276,6 +276,12 @@ if __name__ == '__main__':
                         help='random seed (single-seed study by default)')
     parser.add_argument('--no_compile', action='store_true',
                         help='skip torch.compile and run the model eagerly')
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='override config.DATASET_ROOT (default: env '
+                             'MRC_DATASET_ROOT / DATASET_ROOT, else config)')
+    parser.add_argument('--eval_root', type=str, default=None,
+                        help='override config.EVAL_ROOT (default: env '
+                             'MRC_EVAL_ROOT / EVAL_ROOT, else DATASET_ROOT)')
     parser.add_argument('--log_dir', type=str, default='./logs',
                         help='directory holding tensorboard logs')
     parser.add_argument('--chkpt_dir', type=str, default='./checkpoints',
@@ -292,6 +298,10 @@ if __name__ == '__main__':
                         help='gradient-checkpoint the refinement synthetic '
                              'branch (overrides config.REFINE_GRAD_CKPT)')
     args = parser.parse_args()
+
+    # Data/eval roots: CLI > env (MRC_DATASET_ROOT / MRC_EVAL_ROOT) > config.
+    # Set before spawn so the exported env reaches the worker processes.
+    bop_cfg.set_roots(args.dataset_root, args.eval_root)
 
     # config.REFINE_GRAD_CKPT is the default; the CLI flag only turns it on.
     args.refine_grad_ckpt = args.refine_grad_ckpt or bop_cfg.REFINE_GRAD_CKPT

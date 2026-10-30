@@ -217,8 +217,12 @@ def main():
                         help='subsample mesh vertices for ADD(-S) (0 = all)')
     parser.add_argument('--n_bootstrap', type=int, default=1000)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='override config.DATASET_ROOT (default: env '
+                             'MRC_DATASET_ROOT / DATASET_ROOT, else config)')
     args = parser.parse_args()
 
+    cfg.set_roots(args.dataset_root)
     cfg.set_runtime_overrides(args.dataset, stereo_mode=args.stereo_mode)
     ds_cfg = cfg.DATASET_CONFIG[args.dataset]
     stereo = ds_cfg.get('stereo_mode', 'mono') == 'stereo'
