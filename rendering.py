@@ -133,9 +133,15 @@ class Pytorch3DRenderer:
             specular_color=[[0.1, 0.1, 0.1]],
             direction=light_direction, device=device)
 
+        # Coarse-to-fine binning.  The naive path (``bin_size=0``) is
+        # O(pixels x faces) and dominated the render; meshes are decimated to
+        # <= ``config.MAX_MESH_FACES`` at registry build time, so the
+        # rasterizer's default ``max_faces_per_bin`` (``max(10000, faces/5)``)
+        # can never overflow a bin.  ``bin_size=None`` lets pytorch3d pick its
+        # heuristic for the image size (16 for the 256px crops used here).
         raster_settings = p3d_renderer.RasterizationSettings(
             image_size=image_size, blur_radius=0.0, faces_per_pixel=1,
-            bin_size=0)
+            bin_size=None)
         rasterizer = p3d_renderer.MeshRasterizer(
             cameras=cameras, raster_settings=raster_settings)
         shader = p3d_renderer.HardPhongShader(

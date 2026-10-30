@@ -42,6 +42,14 @@ POSE_SIGMA = 0.03  # standard deviation of quaternion bin distribution
 DEPTH_SIGMA = 0.5     # standard deviation of depth Gaussian distribution
 TRANS_SIGMA = 10 / INPUT_SIZE  # standard deviation of noise in 2D center
 
+# CAD meshes with more faces than this are quadric-decimated at registry build
+# time (pyvista/VTK).  The pytorch3d rasterizer cost scales with the face count
+# (naive path) and needs a large ``max_faces_per_bin`` (binned path), so the
+# dense stereobj-1m models (up to 70k faces) are reduced here.  Keep this at or
+# below 10000: the rasterizer's default ``max_faces_per_bin`` is
+# ``max(10000, faces/5)``, so a decimated mesh can then never overflow a bin.
+MAX_MESH_FACES = 10000
+
 def _env_path(name, default):
     """Root path from ``MRC_<NAME>`` / ``<NAME>`` env vars, else ``default``.
 

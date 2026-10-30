@@ -19,6 +19,7 @@ pycocotools
 webdataset
 tqdm
 trimesh
+pyvista
 tensorboard>=2.17
 iopath
 triton >= 2.1; sys_platform != 'win32'
