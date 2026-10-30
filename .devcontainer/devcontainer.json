@@ -52,6 +52,7 @@
 		"source=mrcnet-uv-cache,target=/home/vscode/.cache/uv,type=volume",
 		"source=mrcnet-kilo-cache,target=/home/vscode/.cache/kilo,type=volume",
 		"source=kilo-auth-cache,target=/home/vscode/.local/share/kilo,type=volume",
+		"source=${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached,readonly",
   		"source=${localEnv:USERPROFILE}/.config/kilo,target=/home/vscode/.config/kilo,type=bind,consistency=cached",
 		"source=D:/6DPose/usprobe,target=${containerWorkspaceFolder}/../datasets/usprobe,type=bind,consistency=cached,readonly",
 		"source=D:/pcarnahanfiles/SteroOBJ-1M,target=${containerWorkspaceFolder}/../datasets/stereobj-1m,type=bind,consistency=cached,readonly",
