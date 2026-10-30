@@ -214,6 +214,8 @@ def main_worker(rank, world_size, args):
                 pbar.set_postfix(loss=loss.item())
                 train_step += 1
                 scheduler.step()
+                if args.max_steps and train_step >= args.max_steps:
+                    break
 
             # Save models; this only needs to be done in one replica
             if world_rank == 0 and epoch % 10 == 0:
@@ -248,6 +250,11 @@ def main_worker(rank, world_size, args):
                 torch.save(state_dict, model_path)
                 print('Saved model to {}'.format(model_path))
 
+            if args.max_steps and train_step >= args.max_steps:
+                print('Reached --max_steps={}; stopping.'.format(
+                    args.max_steps))
+                break
+
     if args.is_parallel:
         dist.destroy_process_group()
 
@@ -260,6 +267,9 @@ if __name__ == '__main__':
                         help='whether to enable multi-gpu training')
     parser.add_argument('--n_epochs', type=int, default=120,
                         help='total number of epochs')
+    parser.add_argument('--max_steps', type=int, default=0,
+                        help='debug: stop after this many optimizer steps '
+                             '(0 = run all epochs)')
     parser.add_argument('--num_workers', type=int, default=8,
                         help='number of workers for parallel data loading')
     parser.add_argument('--dataset', type=str, default='stereobj-1m',
