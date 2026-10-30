@@ -31,10 +31,16 @@ def worker_init_fn(*_):
 
 
 def main_worker(rank, world_size, args):
+    # Per-run dataset overrides (mono/stereo + fusion ablation). Applied here
+    # because spawn re-imports this module in each child, so parent-side
+    # globals would not propagate.
+    bop_cfg.set_runtime_overrides(
+        args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion)
+
     # Fix random seed
-    random.seed(bop_cfg.RANDOM_SEED)
-    np.random.seed(bop_cfg.RANDOM_SEED)
-    torch.manual_seed(bop_cfg.RANDOM_SEED)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
@@ -53,7 +59,8 @@ def main_worker(rank, world_size, args):
     train_dataset = dataset_factory.create_dataset(
         args.dataset, split='train')
 
-    model_config = bop_cfg.ModelConfig.from_dataset_config(args.dataset)
+    model_config = bop_cfg.ModelConfig.from_dataset_config(
+        args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion)
 
     if args.is_parallel:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset)
@@ -66,7 +73,11 @@ def main_worker(rank, world_size, args):
         pin_memory=True, num_workers=args.num_workers,
         drop_last=True, sampler=train_sampler)
 
-    model = models.MRCNet(model_config).to(rank).compile()
+    model = models.MRCNet(model_config).to(rank)
+    if not args.no_compile:
+        # torch.compile is lazy and can fail on boxes without a working
+        # C/C++ toolchain; --no_compile runs eagerly instead.
+        model = model.compile()
 
     if args.pretrained:
         checkpoint = torch.load(
@@ -74,17 +85,18 @@ def main_worker(rank, world_size, args):
             weights_only=True)
         print('loading pre-trained model from {}'.format(args.pretrained))
         network = checkpoint['network']
-        has_fuse = any(k.startswith('stereo_fuse.') for k in network)
-        if model_config.stereo_fusion != has_fuse:
-            # Mono checkpoint -> stereo model (or vice versa): load the shared
-            # weights and leave/ignore the fusion parameters. Only reaches
-            # here for a deliberate cross-mode init; same-mode stays strict.
-            print('WARNING: checkpoint stereo_fuse={} does not match model '
-                  'stereo_fusion={}; loading non-strict'.format(
-                      has_fuse, model_config.stereo_fusion))
-            model.load_state_dict(network, strict=False)
-        else:
+        try:
             model.load_state_dict(network)
+            print('  loaded strictly (all keys matched).')
+        except RuntimeError as exc:
+            # Cross-mode (mono<->stereo) or cross-dataset (different class
+            # count) init: keep the shared weights, re-init the rest.
+            print('  WARNING: strict load failed ({}); loading non-strict '
+                  '(mismatched keys re-initialised).'.format(
+                      type(exc).__name__))
+            missing, unexpected = model.load_state_dict(network, strict=False)
+            print('  missing={} unexpected={}'.format(
+                sorted(missing)[:8], sorted(unexpected)[:8]))
 
     if args.is_parallel:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -205,12 +217,23 @@ def main_worker(rank, world_size, args):
 
             # Save models; this only needs to be done in one replica
             if world_rank == 0 and epoch % 10 == 0:
+                run_config = {
+                    'dataset': args.dataset,
+                    'stereo_mode': args.stereo_mode,
+                    'fusion': args.fusion,
+                    'n_refine_iters': args.n_refine_iters,
+                    'seed': args.seed,
+                    'pretrained': args.pretrained,
+                    'batch_size': args.batch_size,
+                    'n_epochs': args.n_epochs,
+                }
                 if args.is_parallel:
                     state_dict = {
                         'network': model.module.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'model_config': dataclasses.asdict(model_config),
+                        'run_config': run_config,
                         'last_epoch': epoch}
                 else:
                     state_dict = {
@@ -218,6 +241,7 @@ def main_worker(rank, world_size, args):
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'model_config': dataclasses.asdict(model_config),
+                        'run_config': run_config,
                         'last_epoch': epoch}
                 model_path = os.path.join(
                     args.chkpt_dir, 'epoch_{:03d}.pth'.format(epoch))
@@ -238,8 +262,20 @@ if __name__ == '__main__':
                         help='total number of epochs')
     parser.add_argument('--num_workers', type=int, default=8,
                         help='number of workers for parallel data loading')
-    parser.add_argument('--dataset', type=str, default='lm',
+    parser.add_argument('--dataset', type=str, default='stereobj-1m',
                         help='name of the dataset for training and validation')
+    parser.add_argument('--stereo_mode', type=str, default=None,
+                        choices=['mono', 'stereo'],
+                        help='override DATASET_CONFIG stereo_mode for this run '
+                             '(default: the dataset config value)')
+    parser.add_argument('--fusion', type=str, default=None,
+                        choices=list(bop_cfg.FUSION_MODES),
+                        help='stereo fusion operation (only meaningful when '
+                             'stereo_mode=stereo; default cross_view)')
+    parser.add_argument('--seed', type=int, default=bop_cfg.RANDOM_SEED,
+                        help='random seed (single-seed study by default)')
+    parser.add_argument('--no_compile', action='store_true',
+                        help='skip torch.compile and run the model eagerly')
     parser.add_argument('--log_dir', type=str, default='./logs',
                         help='directory holding tensorboard logs')
     parser.add_argument('--chkpt_dir', type=str, default='./checkpoints',

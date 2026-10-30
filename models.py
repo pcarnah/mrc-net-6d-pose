@@ -385,7 +385,11 @@ class MRCNet(nn.Module):
         # mono regressor width; new parameters live only in ``stereo_fuse.*``
         # so mono state_dicts stay bit-for-bit identical.
         self.stereo_fusion = bool(getattr(cfg, 'stereo_fusion', False))
+        self.fusion_mode = getattr(cfg, 'fusion_mode', 'cross_view')
         if self.stereo_fusion:
+            # Always built for stereo models so state_dicts are interchangeable
+            # across fusion variants (left_only/right_only/mean simply bypass
+            # it); only cross_view uses it.
             self.stereo_fuse = ConvGnReLU(4096, 2048, kernel_size=3, padding=1)
 
     def _make_predictions(self, mask_real, mask_synt, pose_logits,
@@ -470,7 +474,14 @@ class MRCNet(nn.Module):
         step = {'render': render, 'render_map': render_map,
                 'mask_synt': mask_synt}
 
-        if x_clf_right is not None:
+        fov_left = torch.concat([
+            t_base[..., :2] / t_base[..., -1:],
+            aux['fov'][..., 2:]], dim=1)
+
+        if x_clf_right is None:
+            x_reg_left['fov'] = fov_left
+            pose_res, depth_res, trans_res = self.regressor(x_reg_left)
+        else:
             T = aux['T_right_ref'].to(torch.float32)
             R_r = T[:, :3, :3] @ R_base
             t_r = (T[:, :3, :3] @ t_base.unsqueeze(-1)).squeeze(-1) \
@@ -479,19 +490,34 @@ class MRCNet(nn.Module):
                 self._render_and_match(
                     x_clf_right, R_r, t_r, aux['obj_cls'],
                     aux['intrinsics_right'], grad_ckpt=grad_ckpt)
-            reg_pool = self.stereo_fuse(torch.cat(
-                [x_reg_left['reg_pool'], x_reg_right['reg_pool']], dim=1))
-            x_reg = {'reg_pool': reg_pool}
             step['render_right'] = render_right
             step['render_map_right'] = render_map_right
             step['mask_synt_right'] = mask_synt_right
-        else:
-            x_reg = x_reg_left
 
-        x_reg['fov'] = torch.concat([
-            t_base[..., :2] / t_base[..., -1:],
-            aux['fov'][..., 2:]], dim=1)
-        pose_res, depth_res, trans_res = self.regressor(x_reg)
+            # All fusion variants feed the shared regressor a left-frame
+            # feature, so the ablation isolates the fusion operation.
+            if self.fusion_mode == 'left_only':
+                x_reg_left['fov'] = fov_left
+                pose_res, depth_res, trans_res = self.regressor(x_reg_left)
+            elif self.fusion_mode == 'right_only':
+                # The right regressor sees the rig-composed pose in the right
+                # crop frame; its residual is composed onto the *left* pose in
+                # _compose_refine, matching the shared-regressor contract.
+                x_reg_right['fov'] = torch.concat([
+                    t_r[..., :2] / t_r[..., -1:],
+                    aux['fov_right'][..., 2:]], dim=1)
+                pose_res, depth_res, trans_res = self.regressor(x_reg_right)
+            elif self.fusion_mode == 'mean':
+                reg_pool = 0.5 * (x_reg_left['reg_pool']
+                                  + x_reg_right['reg_pool'])
+                x_reg = {'reg_pool': reg_pool, 'fov': fov_left}
+                pose_res, depth_res, trans_res = self.regressor(x_reg)
+            else:  # cross_view (default)
+                reg_pool = self.stereo_fuse(torch.cat(
+                    [x_reg_left['reg_pool'], x_reg_right['reg_pool']], dim=1))
+                x_reg = {'reg_pool': reg_pool, 'fov': fov_left}
+                pose_res, depth_res, trans_res = self.regressor(x_reg)
+
         step.update({'pose_res': pose_res, 'depth_res': depth_res,
                      'trans_res': trans_res})
         return step
@@ -570,8 +596,34 @@ class MRCNet(nn.Module):
         trans = predictions['depth_res'].abs() / depth
         return float(torch.maximum(rot.max(), trans.max()))
 
+    def _perturb_init_pose(self, R, t, noise):
+        """Perturb the iteration-0 bootstrap pose (eval-only robustness study).
+
+        ``noise`` is ``(rot_deg, trans_frac)``: a rotation of up to
+        ``rot_deg`` degrees about a random axis and a translation offset of up
+        to ``trans_frac`` * depth along each image axis.  Returns new tensors;
+        the caller uses them as the iteration-0 base only.
+        """
+        rot_deg, trans_frac = noise
+        n = len(t)
+        device = t.device
+        if rot_deg > 0:
+            axis = torch.randn(n, 3, device=device)
+            axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            angle = (torch.rand(n, 1, device=device) * 2 - 1) \
+                * math.radians(rot_deg)
+            R_pert = utils.axis_angle_to_rotations(
+                (axis * angle).cpu().numpy())
+            R_pert = torch.as_tensor(R_pert, dtype=R.dtype, device=device)
+            R = R_pert @ R
+        if trans_frac > 0:
+            jitter = (torch.rand(n, 3, device=device) * 2 - 1) * trans_frac
+            t = t + jitter * t[..., -1:].abs()
+        return R, t
+
     def forward(self, inputs, aux, targets=None, n_refine_iters=1,
-                grad_ckpt=False, refine_stop_thresh=0.0):
+                grad_ckpt=False, refine_stop_thresh=0.0,
+                init_pose_noise=None):
         if n_refine_iters < 1:
             raise ValueError('n_refine_iters must be >= 1')
         weights = cfg.REFINE_ITER_WEIGHTS
@@ -634,6 +686,11 @@ class MRCNet(nn.Module):
         # Iteration 0 bootstraps from the classification argmax; later
         # iterations re-render and refine the previous estimate.
         R_cur, t_cur = rot_init, trans_3d
+        if init_pose_noise is not None and any(
+                v > 0 for v in init_pose_noise):
+            with torch.no_grad():
+                R_cur, t_cur = self._perturb_init_pose(
+                    rot_init, trans_3d, init_pose_noise)
         predictions = None
         losses = {}
         refine_iters_used = n_refine_iters

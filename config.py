@@ -21,6 +21,18 @@ REFINE_ITER_WEIGHTS = None
 # Opt-in gradient checkpointing for the synthetic backbone+decoder branch.
 REFINE_GRAD_CKPT = False
 
+# Two-view fusion variants for the stereo residual-regression branch. All of
+# them feed the *unchanged* shared regressor with a left-frame feature, so the
+# ablation isolates the fusion operation rather than the camera geometry:
+#   cross_view : learned ConvGnReLU(cat(left, right))  (default, main model)
+#   mean       : parameter-free 0.5 * (left + right)   (alternative/simple)
+#   left_only  : left reg_pool only                    (second-view ablation)
+#   right_only : right reg_pool only                   (second-view ablation)
+# `left_only`/`right_only` still render both views (so the comparison holds the
+# input pipeline fixed) but discard the unused view's features.
+FUSION_MODES = ('cross_view', 'mean', 'left_only', 'right_only')
+DEFAULT_FUSION_MODE = 'cross_view'
+
 RANDOM_SEED = 2022      # random seed
 INPUT_IMG_SIZE = 256    # the input image size of network
 OUTPUT_MASK_SIZE = 64   # the output mask size of network
@@ -190,6 +202,8 @@ DATASET_CONFIG = {
         # views (stereo_fusion=True); the classification bootstrap stays mono.
         'stereo_mode': 'stereo',
         'stereo_fusion': True,
+        # Fusion operation; overridable per run via --fusion (see FUSION_MODES).
+        'fusion_mode': 'cross_view',
     },
     'usprobe': {
         'width': 1280,
@@ -258,14 +272,51 @@ class ModelConfig:
     # old checkpoint model_config dicts still construct and mono models keep a
     # bit-for-bit identical state_dict.
     stereo_fusion: bool = False
+    # Fusion operation used when ``stereo_fusion`` is True; see FUSION_MODES.
+    # Defaults to the main model's learned cross-view concat so old stereo
+    # checkpoints (which predate this field) rebuild identically.
+    fusion_mode: str = DEFAULT_FUSION_MODE
 
     @classmethod
-    def from_dataset_config(cls, dataset):
+    def from_dataset_config(cls, dataset, stereo_mode=None, fusion=None):
         dataset_cfg = DATASET_CONFIG[dataset]
+        stereo = dataset_cfg.get('stereo_fusion', False)
+        if stereo_mode is not None:
+            stereo = (stereo_mode == 'stereo')
+        fusion_mode = dataset_cfg.get('fusion_mode', DEFAULT_FUSION_MODE)
+        if fusion is not None:
+            fusion_mode = fusion
         return cls(
             dataset=dataset,
             n_decoders=dataset_cfg['num_class'],
             depth_min=dataset_cfg['Tz_near'],
             depth_max=dataset_cfg['Tz_far'],
             n_depth_bin=Tz_BINS_NUM,
-            stereo_fusion=dataset_cfg.get('stereo_fusion', False))
+            stereo_fusion=stereo,
+            fusion_mode=fusion_mode)
+
+
+def set_runtime_overrides(dataset, stereo_mode=None, fusion=None):
+    """Apply per-run overrides to ``DATASET_CONFIG[dataset]`` in place.
+
+    SLURM jobs are one configuration per process, so mutating the module
+    global is the least invasive way to make mono/stereo and the fusion
+    ablation selectable from the command line without editing this file.
+    Returns the mutated dict.
+    """
+    if dataset not in DATASET_CONFIG:
+        raise ValueError('unknown dataset {!r}'.format(dataset))
+    ds_cfg = DATASET_CONFIG[dataset]
+    if stereo_mode is not None:
+        if stereo_mode not in ('mono', 'stereo'):
+            raise ValueError(
+                "stereo_mode must be 'mono' or 'stereo', got {!r}".format(
+                    stereo_mode))
+        ds_cfg['stereo_mode'] = stereo_mode
+        ds_cfg['stereo_fusion'] = (stereo_mode == 'stereo')
+    if fusion is not None:
+        if fusion not in FUSION_MODES:
+            raise ValueError('fusion must be one of {}, got {!r}'.format(
+                FUSION_MODES, fusion))
+        ds_cfg['fusion_mode'] = fusion
+    return ds_cfg

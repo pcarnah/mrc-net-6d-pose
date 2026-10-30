@@ -127,7 +127,8 @@ def build_rz_crop_batch(view_image, view_cam_K, det_bbox, box_scale,
 def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
                    n_refine_iters=1, refine_stop_thresh=0.0,
                    roi_rgb_right=None, bbox_loc_right=None,
-                   roi_camK_right=None, fov_right=None, T_right_ref=None):
+                   roi_camK_right=None, fov_right=None, T_right_ref=None,
+                   init_pose_noise=None):
     batch_image = torch.from_numpy(roi_rgb).to(device)
     batch_obj_cls = torch.from_numpy(obj_cls).to(device)
     im_height, im_width = batch_image.shape[2:]
@@ -159,7 +160,8 @@ def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
     with torch.no_grad():
         predictions = net(batch_input, aux,
                           n_refine_iters=n_refine_iters,
-                          refine_stop_thresh=refine_stop_thresh)
+                          refine_stop_thresh=refine_stop_thresh,
+                          init_pose_noise=init_pose_noise)
         R_conf = predictions['quat_bin']
         R_index = torch.argmax(torch.amax(R_conf, dim=1))
         t_conf = predictions['depth_bin']
@@ -189,10 +191,30 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default='')
     parser.add_argument('--n_refine_iters', type=int, default=1)
     parser.add_argument('--refine_stop_thresh', type=float, default=0.0)
+    parser.add_argument('--stereo_mode', type=str, default=None,
+                        choices=['mono', 'stereo'],
+                        help='override DATASET_CONFIG stereo_mode (default: '
+                             'the dataset config value)')
+    parser.add_argument('--fusion', type=str, default=None,
+                        choices=list(bop_cfg.FUSION_MODES),
+                        help='override the fusion operation (default: the '
+                             "checkpoint's model_config)")
+    parser.add_argument('--init_rot_noise_deg', type=float, default=0.0,
+                        help='perturb the iteration-0 bootstrap rotation by up '
+                             'to this many degrees (robustness study)')
+    parser.add_argument('--init_trans_noise', type=float, default=0.0,
+                        help='perturb the iteration-0 bootstrap translation by '
+                             'up to this fraction of depth (robustness study)')
     parser.add_argument('--no_compile', action='store_true')
     parser.add_argument('--max_instances', type=int, default=0,
                         help='debug cap on the number of instances (0 = all)')
     args = parser.parse_args()
+
+    bop_cfg.set_runtime_overrides(
+        args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion)
+    init_pose_noise = (args.init_rot_noise_deg, args.init_trans_noise)
+    if not any(v > 0 for v in init_pose_noise):
+        init_pose_noise = None
 
     p = {
         'dataset': args.dataset,
@@ -212,7 +234,8 @@ if __name__ == '__main__':
             print('WARNING: checkpoint dataset {} != CLI dataset {}'.format(
                 model_config.dataset, p['dataset']))
     else:
-        model_config = bop_cfg.ModelConfig.from_dataset_config(p['dataset'])
+        model_config = bop_cfg.ModelConfig.from_dataset_config(
+            p['dataset'], stereo_mode=args.stereo_mode, fusion=args.fusion)
     net = models.MRCNet(model_config).to(device)
     print('building model for {}'.format(p['dataset']))
     print('loading pre-trained model from {}'.format(p['checkpoint']))
@@ -226,6 +249,7 @@ if __name__ == '__main__':
     else:
         net.load_state_dict(network)
     net.eval()
+    model_stereo = bool(net.stereo_fusion)
 
     if args.no_compile:
         print('skipping torch.compile (--no_compile)')
@@ -244,23 +268,36 @@ if __name__ == '__main__':
             net = net._orig_mod
 
     dataset = dataset_factory.create_dataset(p['dataset'], split=args.split)
-    if getattr(dataset, 'stereo_mode', 'mono') != 'stereo':
+    stereo = getattr(dataset, 'stereo_mode', 'mono') == 'stereo'
+    if stereo != model_stereo:
         raise SystemExit(
-            "inference_stereobj.py needs dataset {} stereo_mode='stereo' "
-            "(got {!r})".format(p['dataset'],
-                                getattr(dataset, 'stereo_mode', 'mono')))
+            "dataset stereo_mode={!r} does not match the checkpoint's "
+            "stereo_fusion={} ({}). Pass --stereo_mode to match the "
+            "checkpoint.".format(
+                getattr(dataset, 'stereo_mode', 'mono'), model_stereo,
+                p['checkpoint']))
     est_pose_file = '{}/mrcnet_{}-{}_{}.csv'.format(
         p['eval_root'], p['dataset'], args.split, p['output_suffix_name'])
 
-    # Group instances annotated on both eyes by frame; one webp/json load per
-    # frame serves all its stereo instances.
+    # Group instances by frame; one webp/json load per frame serves all of
+    # them.  stereo: one row per both-eye instance (left frame).  mono: one row
+    # per annotated (instance, eye); scene_id encodes the eye.
+    eye_index = {'left': 0, 'right': 1}
     frame_rows = {}
     for row in range(len(dataset._i_frame)):
-        if int(dataset._i_sides[row]) == 0b11:
-            frame_rows.setdefault(int(dataset._i_frame[row]), []).append(row)
+        sides = int(dataset._i_sides[row])
+        fi = int(dataset._i_frame[row])
+        if stereo:
+            if sides == 0b11:
+                frame_rows.setdefault(fi, []).append((row, 'left'))
+        else:
+            if sides & 1:
+                frame_rows.setdefault(fi, []).append((row, 'left'))
+            if sides & 2:
+                frame_rows.setdefault(fi, []).append((row, 'right'))
     n_inst = sum(len(v) for v in frame_rows.values())
-    print('Evaluation on {}: {} stereo instances in {} images'.format(
-        p['dataset'], n_inst, len(frame_rows)))
+    print('Evaluation on {} [{}]: {} instances in {} images'.format(
+        p['dataset'], 'stereo' if stereo else 'mono', n_inst, len(frame_rows)))
     print(est_pose_file)
 
     import cv2
@@ -271,8 +308,8 @@ if __name__ == '__main__':
     stop_thresh = (args.refine_stop_thresh
                    if args.n_refine_iters > 1 else 0.0)
     pose_results = []
-    for fi, rows in tqdm(sorted(frame_rows.items()),
-                         desc='images', unit='img'):
+    for fi, items in tqdm(sorted(frame_rows.items()),
+                          desc='images', unit='img'):
         shard = dataset._shard_paths[int(dataset._f_shard[fi])]
         with tarfile.open(shard, 'r') as tar:
             webp_buf = dataset._read_member(
@@ -298,14 +335,14 @@ if __name__ == '__main__':
 
         inst_time = []
         frame_objs = []
-        for row in rows:
+        for row, eye in items:
             obj_key = 'Object {}'.format(int(dataset._i_mask[row]) - 1)
             inst_cls = torch.as_tensor(
                 int(dataset._i_cls[row]), dtype=torch.int64)
             inst_name = dataset.cls_names[int(dataset._i_cls[row])]
 
-            def eye_box(eye, x_off):
-                bb = label['scaled_bboxes'][eye][obj_key]
+            def eye_box(view_eye, x_off):
+                bb = label['scaled_bboxes'][view_eye][obj_key]
                 x1 = bb['x_min'] - x_off
                 x2 = bb['x_max'] - x_off
                 y1, y2 = bb['y_min'], bb['y_max']
@@ -316,40 +353,58 @@ if __name__ == '__main__':
                 return (x1, y1, x2, y2), max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE, \
                     cx, cy
 
-            box_l, scale_l, cx_l, cy_l = eye_box('left', 0)
-            box_r, scale_r, cx_r, cy_r = eye_box('right', dataset.EYE_W)
-
             inst_timer = time.time()
-            b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
-                build_rz_crop_batch(
-                    left_image, K_left, box_l, scale_l, cx_l, cy_l,
-                    fx_l, fy_l, dataset_id2cls, inst_cls)
-            _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
-                build_rz_crop_batch(
-                    right_image, K_right, box_r, scale_r, cx_r, cy_r,
-                    fx_r, fy_r, dataset_id2cls, inst_cls)
-            T_right_ref = np.tile(np.eye(4, dtype=np.float32), (4, 1, 1))
-            T_right_ref[:, :3, 3] = -np.einsum(
-                'nij,j->ni', b_Rz,
-                np.array([baseline, 0.0, 0.0], dtype=np.float32))
-
-            (est_R, est_t), _run_time = timed(lambda: inference_func(
-                net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
-                b_roi_camK, b_fov, b_Rz,
-                n_refine_iters=args.n_refine_iters,
-                refine_stop_thresh=stop_thresh,
-                roi_rgb_right=r_roi_rgb, bbox_loc_right=r_bbox_loc,
-                roi_camK_right=r_roi_camK, fov_right=r_fov,
-                T_right_ref=T_right_ref))
+            if stereo:
+                box_l, scale_l, cx_l, cy_l = eye_box('left', 0)
+                box_r, scale_r, cx_r, cy_r = eye_box('right', dataset.EYE_W)
+                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
+                    build_rz_crop_batch(
+                        left_image, K_left, box_l, scale_l, cx_l, cy_l,
+                        fx_l, fy_l, dataset_id2cls, inst_cls)
+                _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
+                    build_rz_crop_batch(
+                        right_image, K_right, box_r, scale_r, cx_r, cy_r,
+                        fx_r, fy_r, dataset_id2cls, inst_cls)
+                T_right_ref = np.tile(np.eye(4, dtype=np.float32), (4, 1, 1))
+                T_right_ref[:, :3, 3] = -np.einsum(
+                    'nij,j->ni', b_Rz,
+                    np.array([baseline, 0.0, 0.0], dtype=np.float32))
+                (est_R, est_t), _run_time = timed(lambda: inference_func(
+                    net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
+                    b_roi_camK, b_fov, b_Rz,
+                    n_refine_iters=args.n_refine_iters,
+                    refine_stop_thresh=stop_thresh,
+                    roi_rgb_right=r_roi_rgb, bbox_loc_right=r_bbox_loc,
+                    roi_camK_right=r_roi_camK, fov_right=r_fov,
+                    T_right_ref=T_right_ref, init_pose_noise=init_pose_noise))
+                scene_id = int(dataset._f_scene_id[fi]) * 2
+            else:
+                x_off = dataset.EYE_W if eye == 'right' else 0
+                view_image = right_image if eye == 'right' else left_image
+                view_K = K_right if eye == 'right' else K_left
+                fx, fy = view_K[0, 0], view_K[1, 1]
+                box, scale, cx, cy = eye_box(eye, x_off)
+                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
+                    build_rz_crop_batch(
+                        view_image, view_K, box, scale, cx, cy, fx, fy,
+                        dataset_id2cls, inst_cls)
+                (est_R, est_t), _run_time = timed(lambda: inference_func(
+                    net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
+                    b_roi_camK, b_fov, b_Rz,
+                    n_refine_iters=args.n_refine_iters,
+                    refine_stop_thresh=stop_thresh,
+                    init_pose_noise=init_pose_noise))
+                scene_id = int(dataset._f_scene_id[fi]) * 2 + eye_index[eye]
             inst_time.append(time.time() - inst_timer)
-            frame_objs.append((inst_name, est_R, est_t))
+            frame_objs.append((inst_name, est_R, est_t, scene_id))
 
         view_cost = np.sum(inst_time) if inst_time else 0.0
-        for inst_name, est_R, est_t in frame_objs:
+        for inst_name, est_R, est_t, scene_id in frame_objs:
             pose_results.append({
                 'time': view_cost,
-                # scene_id encodes the frame; poses are left-frame.
-                'scene_id': int(dataset._f_scene_id[fi]) * 2,
+                # scene_id encodes the frame (and eye in mono); poses are
+                # expressed in the eye's camera frame.
+                'scene_id': scene_id,
                 'im_id': int(dataset._f_image_id[fi]),
                 'obj_id': dataset_id2cls[inst_name] + 1,
                 'score': 1.0,
