@@ -93,8 +93,17 @@ class Pytorch3DRenderer:
             K = K[index]
         return K.to(torch.float32)
 
-    @torch.no_grad()
     def render(self, obj_cls, R_obj, t_obj, views):
+        """Render in fp32 even under AMP.
+
+        pytorch3d's rasterizer has no bf16 kernel, so the caller may run the
+        network in bf16 but the render stays fp32.
+        """
+        with torch.autocast(device_type='cuda', enabled=False):
+            return self._render_fp32(obj_cls, R_obj, t_obj, views)
+
+    @torch.no_grad()
+    def _render_fp32(self, obj_cls, R_obj, t_obj, views):
         device = R_obj.device
         n = len(obj_cls)
         n_views = len(views)

@@ -33,6 +33,7 @@
 #   N_GPUS              GPUs on the node (torchrun DDP if >1)      [1]
 #   SAVE_EVERY_STEPS    checkpoint every N optimizer steps (0=off) [2000]
 #   SAVE_EVERY_EPOCHS   checkpoint every N epochs (0=off)          [1]
+#   BF16                1 to train with bf16 autocast (renderer fp32) [1]
 #   PRETRAINED          checkpoint path for init (empty = fresh)   []
 #   EXTRA_ARGS          extra main.py flags (e.g. --no_compile)    []
 #   MRC_VENV            pre-built venv to reuse (else $SLURM_TMPDIR/env)
@@ -69,6 +70,7 @@ WARMUP="${WARMUP:-1000}"
 N_GPUS="${N_GPUS:-1}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-10000}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
+BF16="${BF16:-1}"
 PRETRAINED="${PRETRAINED:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -82,6 +84,8 @@ FUSION_ARG=""
 [ -n "$FUSION" ] && FUSION_ARG="--fusion $FUSION"
 PRETRAINED_ARG=""
 [ -n "$PRETRAINED" ] && PRETRAINED_ARG="--pretrained $PRETRAINED"
+BF16_ARG=""
+[ "$BF16" = "1" ] && BF16_ARG="--bf16"
 
 echo "run=$RUN_NAME dataset=$DATASET stereo=$STEREO_MODE fusion=$FUSION K=$N_REFINE gpus=$N_GPUS"
 
@@ -93,7 +97,7 @@ if [ "$N_GPUS" -gt 1 ]; then
     --batch_size "$BATCH_SIZE" --num_workers "$NUM_WORKERS" \
     --warmup_step "$WARMUP" --chkpt_dir "$CHKPT_DIR" --log_dir "$LOG_DIR" \
     --save_every_steps "$SAVE_EVERY_STEPS" \
-    --save_every_epochs "$SAVE_EVERY_EPOCHS" \
+    --save_every_epochs "$SAVE_EVERY_EPOCHS" $BF16_ARG \
     $PRETRAINED_ARG $EXTRA_ARGS
 else
   python main.py \
@@ -102,6 +106,6 @@ else
     --batch_size "$BATCH_SIZE" --num_workers "$NUM_WORKERS" \
     --warmup_step "$WARMUP" --chkpt_dir "$CHKPT_DIR" --log_dir "$LOG_DIR" \
     --save_every_steps "$SAVE_EVERY_STEPS" \
-    --save_every_epochs "$SAVE_EVERY_EPOCHS" \
+    --save_every_epochs "$SAVE_EVERY_EPOCHS" $BF16_ARG \
     $PRETRAINED_ARG $EXTRA_ARGS
 fi

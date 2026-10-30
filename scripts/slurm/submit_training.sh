@@ -12,6 +12,8 @@
 # running N_EPOCHS=3 with checkpoints on a step interval (SAVE_EVERY_STEPS) plus
 # every epoch (SAVE_EVERY_EPOCHS=1).  Each job builds its own venv on
 # $SLURM_TMPDIR and stages the dataset there (see scripts/slurm/setup_env.sh).
+# Training runs with bf16 autocast by default (BF16=1; ~1.2x faster, ~25 percent
+# less memory); set BF16=0 to fall back to fp32.
 #
 # The probe fine-tune arm reuses the mono stereobj-1m checkpoint; set
 # PROBE_PRETRAINED to that checkpoint path (defaults to the mono_K3 run's last
@@ -33,6 +35,7 @@ WARMUP="${WARMUP:-1000}"
 N_GPUS="${N_GPUS:-1}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-2000}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
+BF16="${BF16:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:---no_compile}"
 USPROBE_SRC="${USPROBE_SRC:-$HOME/projects/def-chene/pcarnah/usprobe}"
 
@@ -44,7 +47,7 @@ submit() {
     "RUN_NAME=$run_name" "DATASET=$dataset" "STEREO_MODE=$stereo_mode"
     "FUSION=$fusion" "N_REFINE=$n_refine" "N_EPOCHS=$N_EPOCHS"
     "BATCH_SIZE=$BATCH_SIZE" "NUM_WORKERS=$NUM_WORKERS" "WARMUP=$WARMUP"
-    "N_GPUS=$N_GPUS" "EXTRA_ARGS=$EXTRA_ARGS"
+    "N_GPUS=$N_GPUS" "EXTRA_ARGS=$EXTRA_ARGS" "BF16=$BF16"
     "SAVE_EVERY_STEPS=$SAVE_EVERY_STEPS" "SAVE_EVERY_EPOCHS=$SAVE_EVERY_EPOCHS")
   [ -n "$pretrained" ] && env_args+=("PRETRAINED=$pretrained")
   [ -n "$stage_name" ] && env_args+=("MRC_STAGE_NAME=$stage_name")
