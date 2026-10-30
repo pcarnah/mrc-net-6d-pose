@@ -15,54 +15,60 @@
 #   RUN_NAME=stereo_cross_K3 DATASET=stereobj-1m STEREO_MODE=stereo \
 #     FUSION=cross_view N_REFINE=3 N_GPUS=1 sbatch scripts/slurm/train.sbatch
 #
+# The job builds a per-job venv on $SLURM_TMPDIR and stages the dataset there
+# (see scripts/slurm/setup_env.sh).  stereobj-1m is ~24h/epoch, so the default
+# wall time is the 7-day maximum and checkpoints are written on a step interval
+# (plus every epoch) so a timeout/crash does not lose the whole run.
+#
 # Environment:
-#   RUN_NAME     run label (checkpoint/log subdir)          [mrcnet]
-#   DATASET      DATASET_CONFIG key                         [stereobj-1m]
-#   STEREO_MODE  mono|stereo (empty = dataset default)      [stereo]
-#   FUSION       cross_view|mean|left_only|right_only       [cross_view]
-#   N_REFINE     refinement iterations K                    [3]
-#   N_EPOCHS     epochs                                     [75]
-#   BATCH_SIZE   global batch size                          [16]
-#   NUM_WORKERS  dataloader workers                         [8]
-#   WARMUP       LR warmup steps (must be < steps/epoch)    [1000]
-#   N_GPUS       GPUs on the node (torchrun DDP if >1)      [1]
-#   PRETRAINED   checkpoint path for init (empty = fresh)   []
-#   EXTRA_ARGS   extra main.py flags (e.g. --no_compile)    []
-#   MRC_VENV     path to a venv to activate (optional)      []
-#   MRC_CONDA_ENV  conda env name to activate (optional)    []
-#   DATASET_ROOT / EVAL_ROOT  data/eval roots; default $SLURM_TMPDIR  []
+#   RUN_NAME            run label (checkpoint/log subdir)          [mrcnet]
+#   DATASET             DATASET_CONFIG key                         [stereobj-1m]
+#   STEREO_MODE         mono|stereo (empty = dataset default)      [stereo]
+#   FUSION              cross_view|mean|left_only|right_only       [cross_view]
+#   N_REFINE            refinement iterations K                    [3]
+#   N_EPOCHS            epochs                                     [3]
+#   BATCH_SIZE          global batch size                          [16]
+#   NUM_WORKERS         dataloader workers                         [8]
+#   WARMUP              LR warmup steps (must be < steps/epoch)    [1000]
+#   N_GPUS              GPUs on the node (torchrun DDP if >1)      [1]
+#   SAVE_EVERY_STEPS    checkpoint every N optimizer steps (0=off) [2000]
+#   SAVE_EVERY_EPOCHS   checkpoint every N epochs (0=off)          [1]
+#   PRETRAINED          checkpoint path for init (empty = fresh)   []
+#   EXTRA_ARGS          extra main.py flags (e.g. --no_compile)    []
+#   MRC_VENV            pre-built venv to reuse (else $SLURM_TMPDIR/env)
+#   MRC_CONDA_ENV       conda env to activate instead of a venv
+#   MRC_DATASET_ROOT / MRC_EVAL_ROOT  data/eval roots  [default $SLURM_TMPDIR]
+#   MRC_STAGE_SRC / MRC_STAGE_NAME    dataset to stage [stereobj-1m]
+#   TORCH_HOME          torch hub cache dir  [/home/pcarnah/scratch/torch_hub]
 
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/../..}"
 
-if [ -n "${MRC_VENV:-}" ]; then
-  # shellcheck disable=SC1091
-  source "${MRC_VENV}/bin/activate"
-fi
-if [ -n "${MRC_CONDA_ENV:-}" ]; then
-  eval "$(conda shell.bash hook)"
-  conda activate "${MRC_CONDA_ENV}"
-fi
-
 # Data/eval roots: an explicit MRC_* / DATASET_ROOT / EVAL_ROOT wins, else use
 # the per-job staging dir $SLURM_TMPDIR when present.  (config.py also accepts
 # --dataset_root / --eval_root on the command line.)
-if [ -n "${SLURM_TMPDIR:-}" ]; then
-  export MRC_DATASET_ROOT="${MRC_DATASET_ROOT:-${DATASET_ROOT:-$SLURM_TMPDIR}}"
-  export MRC_EVAL_ROOT="${MRC_EVAL_ROOT:-${EVAL_ROOT:-$SLURM_TMPDIR}}"
-fi
+export MRC_DATASET_ROOT="${MRC_DATASET_ROOT:-${DATASET_ROOT:-$SLURM_TMPDIR}}"
+export MRC_EVAL_ROOT="${MRC_EVAL_ROOT:-${EVAL_ROOT:-$SLURM_TMPDIR}}"
+export MRC_DATASET="${DATASET:-stereobj-1m}"
+
+# Modules, per-job venv (requirements-cluster.txt + the pytorch3d wheel) and the
+# background dataset staging copy.
+# shellcheck source=scripts/slurm/setup_env.sh
+source scripts/slurm/setup_env.sh
 
 RUN_NAME="${RUN_NAME:-mrcnet}"
 DATASET="${DATASET:-stereobj-1m}"
 STEREO_MODE="${STEREO_MODE:-stereo}"
 FUSION="${FUSION:-cross_view}"
 N_REFINE="${N_REFINE:-3}"
-N_EPOCHS="${N_EPOCHS:-75}"
+N_EPOCHS="${N_EPOCHS:-3}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 WARMUP="${WARMUP:-1000}"
 N_GPUS="${N_GPUS:-1}"
+SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-10000}"
+SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
 PRETRAINED="${PRETRAINED:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -86,6 +92,8 @@ if [ "$N_GPUS" -gt 1 ]; then
     --n_refine_iters "$N_REFINE" --n_epochs "$N_EPOCHS" \
     --batch_size "$BATCH_SIZE" --num_workers "$NUM_WORKERS" \
     --warmup_step "$WARMUP" --chkpt_dir "$CHKPT_DIR" --log_dir "$LOG_DIR" \
+    --save_every_steps "$SAVE_EVERY_STEPS" \
+    --save_every_epochs "$SAVE_EVERY_EPOCHS" \
     $PRETRAINED_ARG $EXTRA_ARGS
 else
   python main.py \
@@ -93,5 +101,7 @@ else
     --n_refine_iters "$N_REFINE" --n_epochs "$N_EPOCHS" \
     --batch_size "$BATCH_SIZE" --num_workers "$NUM_WORKERS" \
     --warmup_step "$WARMUP" --chkpt_dir "$CHKPT_DIR" --log_dir "$LOG_DIR" \
+    --save_every_steps "$SAVE_EVERY_STEPS" \
+    --save_every_epochs "$SAVE_EVERY_EPOCHS" \
     $PRETRAINED_ARG $EXTRA_ARGS
 fi

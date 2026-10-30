@@ -1,0 +1,25 @@
+# Cluster (Alliance SLURM) requirements.
+#
+# Same set as requirements.txt, minus pytorch3d: the cluster has no internet on
+# compute nodes, so pytorch3d is installed from a locally built wheel instead
+# of an index:
+#
+#   pip install --no-index --no-deps $HOME/wheels/pytorch3d-*.whl
+#
+# Installed with `pip install --no-index -r requirements-cluster.txt` inside
+# the per-job venv (see scripts/slurm/setup_env.sh), so the package-index lines
+# from requirements.txt are intentionally omitted and everything resolves from
+# the module wheelhouse.
+torch==2.11.0
+torchvision
+kornia
+numpy
+opencv_python<=4.11
+pycocotools
+webdataset
+tqdm
+trimesh
+tensorboard>=2.17
+iopath
+triton >= 2.1; sys_platform != 'win32'
+triton-windows >= 3.0; sys_platform == 'win32'

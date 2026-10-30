@@ -152,6 +152,34 @@ def main_worker(rank, world_size, args):
             os.makedirs(args.chkpt_dir)
 
     train_step = 0
+
+    def save_checkpoint(tag, epoch, step):
+        """Write one checkpoint (rank 0 only); `tag` is the file name."""
+        run_config = {
+            'dataset': args.dataset,
+            'stereo_mode': args.stereo_mode,
+            'fusion': args.fusion,
+            'n_refine_iters': args.n_refine_iters,
+            'seed': args.seed,
+            'pretrained': args.pretrained,
+            'batch_size': args.batch_size,
+            'n_epochs': args.n_epochs,
+        }
+        network = (model.module.state_dict() if args.is_parallel
+                   else model.state_dict())
+        state_dict = {
+            'network': network,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'model_config': dataclasses.asdict(model_config),
+            'run_config': run_config,
+            'last_epoch': epoch,
+            'last_step': step,
+        }
+        model_path = os.path.join(args.chkpt_dir, tag)
+        torch.save(state_dict, model_path)
+        print('Saved model to {}'.format(model_path))
+
     gpu_keys = ['roi_obj_R', 'roi_obj_t', 'roi_mask', 'quat_bin',
                 'roi_camK', 'obj_cls', 'fov']
     for epoch in range(start_epoch, args.n_epochs):
@@ -214,41 +242,18 @@ def main_worker(rank, world_size, args):
                 pbar.set_postfix(loss=loss.item())
                 train_step += 1
                 scheduler.step()
+                if world_rank == 0 and args.save_every_steps > 0 \
+                        and train_step % args.save_every_steps == 0:
+                    save_checkpoint(
+                        'step_{:08d}.pth'.format(train_step), epoch, train_step)
                 if args.max_steps and train_step >= args.max_steps:
                     break
 
             # Save models; this only needs to be done in one replica
-            if world_rank == 0 and epoch % 10 == 0:
-                run_config = {
-                    'dataset': args.dataset,
-                    'stereo_mode': args.stereo_mode,
-                    'fusion': args.fusion,
-                    'n_refine_iters': args.n_refine_iters,
-                    'seed': args.seed,
-                    'pretrained': args.pretrained,
-                    'batch_size': args.batch_size,
-                    'n_epochs': args.n_epochs,
-                }
-                if args.is_parallel:
-                    state_dict = {
-                        'network': model.module.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'model_config': dataclasses.asdict(model_config),
-                        'run_config': run_config,
-                        'last_epoch': epoch}
-                else:
-                    state_dict = {
-                        'network': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'model_config': dataclasses.asdict(model_config),
-                        'run_config': run_config,
-                        'last_epoch': epoch}
-                model_path = os.path.join(
-                    args.chkpt_dir, 'epoch_{:03d}.pth'.format(epoch))
-                torch.save(state_dict, model_path)
-                print('Saved model to {}'.format(model_path))
+            if world_rank == 0 and args.save_every_epochs > 0 \
+                    and epoch % args.save_every_epochs == 0:
+                save_checkpoint(
+                    'epoch_{:03d}.pth'.format(epoch), epoch, train_step)
 
             if args.max_steps and train_step >= args.max_steps:
                 print('Reached --max_steps={}; stopping.'.format(
@@ -307,6 +312,13 @@ if __name__ == '__main__':
     parser.add_argument('--refine_grad_ckpt', action='store_true',
                         help='gradient-checkpoint the refinement synthetic '
                              'branch (overrides config.REFINE_GRAD_CKPT)')
+    parser.add_argument('--save_every_steps', type=int, default=0,
+                        help='save a checkpoint every N optimizer steps '
+                             '(0 = disabled; useful for long epochs where a '
+                             'job may time out before the next epoch)')
+    parser.add_argument('--save_every_epochs', type=int, default=10,
+                        help='save a checkpoint at the end of every N epochs '
+                             '(0 = disabled; default 10)')
     args = parser.parse_args()
 
     # Data/eval roots: CLI > env (MRC_DATASET_ROOT / MRC_EVAL_ROOT) > config.

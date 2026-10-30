@@ -12,6 +12,9 @@
 # step count.  Writes a BOP-format CSV under $EVAL_ROOT and, optionally, runs
 # the ADD(-S)/projection evaluator on it.
 #
+# The job builds a per-job venv on $SLURM_TMPDIR and stages the dataset there
+# (see scripts/slurm/setup_env.sh).
+#
 # Environment:
 #   RUN_NAME       run label (matches the training run)      [mrcnet]
 #   DATASET        DATASET_CONFIG key                        [stereobj-1m]
@@ -19,34 +22,32 @@
 #   STEREO_MODE    mono|stereo (empty = dataset default)     [stereo]
 #   FUSION         fusion override (empty = checkpoint's)    []
 #   N_REFINE       test-time steps K                         [1]
-#   MODEL_NAME     checkpoint file stem (no .pth)            [epoch_074]
+#   MODEL_NAME     checkpoint file stem (no .pth)            [epoch_002]
 #   SUFFIX         CSV output suffix                         [k1]
 #   INIT_ROT_NOISE bootstrap rotation noise (deg)            [0]
 #   INIT_TRANS_NOISE bootstrap translation noise (frac)      [0]
 #   EVAL           1 to run tools/eval_stereobj.py after     [1]
 #   EXTRA_ARGS     extra inference flags (e.g. --no_compile) []
-#   DATASET_ROOT / EVAL_ROOT  data/eval roots; default $SLURM_TMPDIR  []
+#   MRC_VENV / MRC_CONDA_ENV  pre-built env to reuse (see setup_env.sh)
+#   MRC_DATASET_ROOT / MRC_EVAL_ROOT  data/eval roots  [default $SLURM_TMPDIR]
+#   MRC_STAGE_SRC / MRC_STAGE_NAME    dataset to stage [stereobj-1m]
+#   TORCH_HOME     torch hub cache dir  [/home/pcarnah/scratch/torch_hub]
 
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/../..}"
 
-if [ -n "${MRC_VENV:-}" ]; then
-  # shellcheck disable=SC1091
-  source "${MRC_VENV}/bin/activate"
-fi
-if [ -n "${MRC_CONDA_ENV:-}" ]; then
-  eval "$(conda shell.bash hook)"
-  conda activate "${MRC_CONDA_ENV}"
-fi
-
 # Data/eval roots: explicit MRC_* / DATASET_ROOT / EVAL_ROOT wins, else the
 # per-job staging dir $SLURM_TMPDIR.  config.py also accepts --dataset_root /
 # --eval_root on the command line.
-if [ -n "${SLURM_TMPDIR:-}" ]; then
-  export MRC_DATASET_ROOT="${MRC_DATASET_ROOT:-${DATASET_ROOT:-$SLURM_TMPDIR}}"
-  export MRC_EVAL_ROOT="${MRC_EVAL_ROOT:-${EVAL_ROOT:-$SLURM_TMPDIR}}"
-fi
+export MRC_DATASET_ROOT="${MRC_DATASET_ROOT:-${DATASET_ROOT:-$SLURM_TMPDIR}}"
+export MRC_EVAL_ROOT="${MRC_EVAL_ROOT:-${EVAL_ROOT:-$SLURM_TMPDIR}}"
+export MRC_DATASET="${DATASET:-stereobj-1m}"
+
+# Modules, per-job venv (requirements-cluster.txt + the pytorch3d wheel) and the
+# background dataset staging copy.
+# shellcheck source=scripts/slurm/setup_env.sh
+source scripts/slurm/setup_env.sh
 
 RUN_NAME="${RUN_NAME:-mrcnet}"
 DATASET="${DATASET:-stereobj-1m}"
@@ -54,7 +55,7 @@ SPLIT="${SPLIT:-val}"
 STEREO_MODE="${STEREO_MODE:-stereo}"
 FUSION="${FUSION:-}"
 N_REFINE="${N_REFINE:-1}"
-MODEL_NAME="${MODEL_NAME:-epoch_070}"
+MODEL_NAME="${MODEL_NAME:-epoch_002}"
 SUFFIX="${SUFFIX:-k${N_REFINE}}"
 INIT_ROT_NOISE="${INIT_ROT_NOISE:-0}"
 INIT_TRANS_NOISE="${INIT_TRANS_NOISE:-0}"

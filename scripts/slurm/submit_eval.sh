@@ -5,16 +5,16 @@
 #   bash scripts/slurm/submit_eval.sh
 #   DRY_RUN=1 bash scripts/slurm/submit_eval.sh
 #
-# Environment: MODEL_NAME (checkpoint stem, default epoch_070), STEPS (default
-# "1 2 3"), NOISE_DEG (default "5 10 20"), MRC_VENV/MRC_CONDA_ENV as in
-# train.sbatch.
+# Environment: MODEL_NAME (checkpoint stem, default epoch_002 = the last epoch
+# of the default 3-epoch run), STEPS (default "1 2 3"), NOISE_DEG (default
+# "5 10 20"), MRC_VENV/MRC_CONDA_ENV as in train.sbatch.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
 SBATCH="${SBATCH:-sbatch}"
 DRY_RUN="${DRY_RUN:-0}"
-MODEL_NAME="${MODEL_NAME:-epoch_070}"
+MODEL_NAME="${MODEL_NAME:-epoch_002}"
 STEPS="${STEPS:-1 2 3}"
 NOISE_DEG="${NOISE_DEG:-5 10 20}"
 
