@@ -1239,23 +1239,43 @@ def make_roi(bbox_loc, image_size):
 
 
 def image_to_bbox_map(image_tensor):
+    """Bounding-box maps of the visible region, one per sample.
+
+    Fully vectorized: the renderer calls this on every synthetic render, and
+    the previous per-sample Python loop (``torch.where`` / ``min`` / ``max``
+    plus ``make_roi``'s ``.item()``) forced a GPU->CPU sync per sample, which
+    made the forward CPU-bound.  Output is bit-identical to the loop version.
     """
-    Create bounding box maps based on visible image regions
-    """
-    image_mask = (image_tensor.sum(dim=1) > 0).float()
-    batch_size = len(image_mask)
-    batch_size = len(image_mask)
-    batch_bbox = torch.zeros((batch_size, 4), device=image_mask.device,
-                             dtype=torch.float)
-    for index, mask in enumerate(image_mask):
-        if torch.any(mask):
-            y, x = torch.where(mask != 0)
-            batch_bbox[index, 0] = torch.min(x) / image_mask.shape[-1]
-            batch_bbox[index, 1] = torch.min(y) / image_mask.shape[-2]
-            batch_bbox[index, 2] = torch.max(x) / image_mask.shape[-1]
-            batch_bbox[index, 3] = torch.max(y) / image_mask.shape[-2]
-        else:
-            batch_bbox[index] = -torch.ones(4)
-    bbox_map = torch.stack([
-        make_roi(bbox, image_mask.shape[-1]) for bbox in batch_bbox], dim=0)
-    return bbox_map
+    image_mask = image_tensor.sum(dim=1) > 0            # (N, H, W) bool
+    n, height, width = image_mask.shape
+    cols = torch.arange(width, device=image_mask.device,
+                        dtype=torch.float32).view(1, 1, width)
+    rows = torch.arange(height, device=image_mask.device,
+                        dtype=torch.float32).view(1, height, 1)
+    xmin = torch.where(image_mask, cols, float(width)).amin(dim=(1, 2))
+    xmax = torch.where(image_mask, cols, -1.0).amax(dim=(1, 2))
+    ymin = torch.where(image_mask, rows, float(height)).amin(dim=(1, 2))
+    ymax = torch.where(image_mask, rows, -1.0).amax(dim=(1, 2))
+    empty = ~image_mask.any(dim=(1, 2))
+    xmin = torch.where(empty, torch.full_like(xmin, -1.0), xmin / width)
+    xmax = torch.where(empty, torch.full_like(xmax, -1.0), xmax / width)
+    ymin = torch.where(empty, torch.full_like(ymin, -1.0), ymin / height)
+    ymax = torch.where(empty, torch.full_like(ymax, -1.0), ymax / height)
+
+    # make_roi's dilation, computed from the un-dilated box.
+    delta = (cfg.ZOOM_SCALE_RATIO + cfg.ZOOM_SHIFT_RATIO) * 0.25
+    dw = (xmax - xmin) * delta
+    dh = (ymax - ymin) * delta
+    image_size = width
+    xmin_i = torch.clamp(torch.round((xmin - dw) * image_size), min=0).long()
+    ymin_i = torch.clamp(torch.round((ymin - dh) * image_size), min=0).long()
+    xmax_i = torch.clamp(torch.round((xmax + dw) * image_size),
+                         max=image_size).long()
+    ymax_i = torch.clamp(torch.round((ymax + dh) * image_size),
+                         max=image_size).long()
+
+    xs = torch.arange(image_size, device=image_mask.device).view(1, 1, image_size)
+    ys = torch.arange(image_size, device=image_mask.device).view(1, image_size, 1)
+    roi = ((xs >= xmin_i.view(-1, 1, 1)) & (xs < xmax_i.view(-1, 1, 1)) &
+           (ys >= ymin_i.view(-1, 1, 1)) & (ys < ymax_i.view(-1, 1, 1)))
+    return roi.float()

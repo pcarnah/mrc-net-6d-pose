@@ -59,6 +59,33 @@ class Pytorch3DRenderer:
         self.surf_color = list(surf_color)
         self._blend_params = p3d_renderer.BlendParams(
             background_color=[0., 0., 0.])
+        # The refinement loop renders the same objects at several poses, so the
+        # (identical) mesh batch is cached instead of rebuilt on every call.
+        self._mesh_cache_key = None
+        self._mesh_cache = None
+
+    def _meshes_for(self, obj_cls, n_views, device):
+        """The ``Meshes`` batch (sample-major, then view), cached per obj_cls."""
+        key = (tuple(int(c) for c in obj_cls.tolist()), n_views, device)
+        if key == self._mesh_cache_key:
+            return self._mesh_cache
+        verts_list, faces_list, colors_list = [], [], []
+        for i in obj_cls:
+            verts = self.registry.get_vertices(i)
+            faces = self.registry.get_faces(i).to(device)
+            colors = torch.tensor(
+                [self.surf_color], device=device).expand(len(verts), 3)
+            for _ in range(n_views):
+                verts_list.append(verts)
+                faces_list.append(faces)
+                colors_list.append(colors)
+        textures = p3d_renderer.TexturesVertex(verts_features=colors_list)
+        meshes = p3d_struct.Meshes(
+            verts=verts_list, faces=faces_list,
+            textures=textures).to(device)
+        self._mesh_cache_key = key
+        self._mesh_cache = meshes
+        return meshes
 
     def _intrinsics_for(self, view, index):
         K = view.K
@@ -82,20 +109,7 @@ class Pytorch3DRenderer:
             view_t.append(T[:3, 3])
 
         # Mesh batch replicated x n_views (sample-major, then view).
-        verts_list, faces_list, colors_list = [], [], []
-        for i in obj_cls:
-            verts = self.registry.get_vertices(i)
-            faces = self.registry.get_faces(i).to(device)
-            colors = torch.tensor(
-                [self.surf_color], device=device).expand(len(verts), 3)
-            for _ in range(n_views):
-                verts_list.append(verts)
-                faces_list.append(faces)
-                colors_list.append(colors)
-        textures = p3d_renderer.TexturesVertex(verts_features=colors_list)
-        meshes = p3d_struct.Meshes(
-            verts=verts_list, faces=faces_list,
-            textures=textures).to(device)
+        meshes = self._meshes_for(obj_cls, n_views, device)
 
         batch = n * n_views
         focal_length, principal_point = [], []
