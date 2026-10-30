@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=mrcnet-train
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --gpus=h100_3g.40gb:1
+#SBATCH --time=1:00:00
+#SBATCH --mem=60G
 #SBATCH --output=logs/slurm/%x-%j.out
 #SBATCH --error=logs/slurm/%x-%j.err
 
@@ -27,7 +26,7 @@
 #   FUSION              cross_view|mean|left_only|right_only       [cross_view]
 #   N_REFINE            refinement iterations K                    [3]
 #   N_EPOCHS            epochs                                     [3]
-#   BATCH_SIZE          global batch size                          [16]
+#   BATCH_SIZE          global batch size                          [24]
 #   NUM_WORKERS         dataloader workers                         [8]
 #   WARMUP              LR warmup steps (must be < steps/epoch)    [1000]
 #   N_GPUS              GPUs on the node (torchrun DDP if >1)      [1]
@@ -107,5 +106,6 @@ else
     --warmup_step "$WARMUP" --chkpt_dir "$CHKPT_DIR" --log_dir "$LOG_DIR" \
     --save_every_steps "$SAVE_EVERY_STEPS" \
     --save_every_epochs "$SAVE_EVERY_EPOCHS" $BF16_ARG \
+    --no_compile \
     $PRETRAINED_ARG $EXTRA_ARGS
 fi
