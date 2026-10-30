@@ -5,6 +5,7 @@ import torch
 import random
 import numpy as np
 import bop_dataset as data
+import stereobj_dataset
 import dataset_factory
 import models
 import argparse
@@ -195,7 +196,15 @@ def main_worker(rank, world_size, args):
                     batch['bbox_map'].to(rank, non_blocking=True)], dim=1)
 
                 targets = {key: batch[key].to(rank, non_blocking=True)
-                           for key in gpu_keys}
+                           for key in gpu_keys if key in batch}
+                if 'quat_bin' not in targets:
+                    # Webdataset adapters (stereobj-1m) do not ship quat
+                    # labels; quantize the whole batch on GPU instead of
+                    # ~0.2 s/sample in the DataLoader workers.
+                    targets['quat_bin'] = \
+                        stereobj_dataset.compute_quat_bin_targets(
+                            train_dataset.registry, targets['obj_cls'],
+                            targets['roi_obj_R'])
 
                 aux = {'obj_cls': targets['obj_cls'],
                        'fov': targets['fov'],

@@ -16,6 +16,12 @@ Layout (batch dimension added by the collate function):
         roi_obj_t  float32 (3,)     ground-truth translation
         roi_mask   float32 (M, M)
         quat_bin   float32 (N_POSE_BIN,)
+                                   BOP adapters precompute this per
+                                   instance; webdataset adapters
+                                   (stereobj-1m) omit it and the trainer
+                                   quantizes the batch on GPU from
+                                   ``roi_obj_R`` (see
+                                   stereobj_dataset.compute_quat_bin_targets)
     meta (ints, never moved to the GPU as targets)
         obj_id, scene_id, image_id
 

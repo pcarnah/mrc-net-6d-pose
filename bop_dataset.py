@@ -67,9 +67,9 @@ class BOP_Dataset(PoseDataset):
         self.filter_invalid = True
         self.mask_morph_kernel_size = 3
         # Photometric augmentation, applied to the crop together with its mask.
-        # The image is fed as a float tensor in [0, 1]; the mask is passed
-        # through untouched by the colour transforms and only erased alongside
-        # the dropped-out regions.
+        # The image is fed as a float tensor in [0, 1]. torchvision v2
+        # dispatches the photometric transforms (and RandomErasing) to
+        # images only and passes the mask through untouched.
         self.color_augmentor = v2.Compose([
             v2.RandomApply([v2.GaussianNoise(sigma=0.01)], p=0.5),
             v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 1.2))], p=0.5),

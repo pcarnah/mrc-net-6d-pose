@@ -39,6 +39,14 @@ Modes:
            ``PoseSample`` in dataset_schema). Both eyes share the same Rz
            crop-augmentation index; photometric and DZI augmentation stay
            per-eye independent.
+
+Unlike ``BOP_Dataset``, samples do NOT carry ``quat_bin``: the 1M+
+instance table is far too large to precompute and per-sample CPU
+quantization is too slow for the DataLoader workers. The trainer
+computes the bin distribution for the whole batch on GPU from the
+sample's Rz-composed ``roi_obj_R`` (see ``compute_quat_bin_targets``),
+which also keeps the label convention identical to BOP (quantize the
+Rz-composed rotation, with no further Rz composition).
 """
 import io
 import os
@@ -77,6 +85,24 @@ DEFAULT_CY_ORIG = 787.1127624511719
 BASELINE_PX_ORIG = 63.34150140067935
 
 EYE_KEYS = ['left', 'right']
+
+# Open-tarfile cache (per process, shared by every dataset instance in it).
+# Reopening a tar costs ~15 ms per sample; with random shard access the
+# cache holds every shard open (tens of files), bounded by an LRU so very
+# large shard counts cannot exhaust the file-handle limit.
+TAR_CACHE_MAX = 64
+_TAR_CACHE = {}
+
+
+def _get_tar(shard_path):
+    tar = _TAR_CACHE.get(shard_path)
+    if tar is None:
+        tar = tarfile.open(shard_path, 'r')
+        _TAR_CACHE[shard_path] = tar
+        if len(_TAR_CACHE) > TAR_CACHE_MAX:
+            _, evicted = _TAR_CACHE.popitem(last=False)
+            evicted.close()
+    return tar
 
 
 class StereobjDataset(PoseDataset):
@@ -428,14 +454,14 @@ class StereobjDataset(PoseDataset):
         """Read the label json, stereo webp pair and mask for one frame."""
         import json
         shard = self._shard_paths[self._f_shard[fi]]
-        with tarfile.open(shard, 'r') as tar:
-            label = json.loads(self._read_member(
-                tar, self._f_json_offset[fi],
-                self._f_json_size[fi]).decode('utf-8'))
-            webp_buf = self._read_member(
-                tar, self._f_webp_offset[fi], self._f_webp_size[fi])
-            mask_buf = self._read_member(
-                tar, self._f_mask_offset[fi], self._f_mask_size[fi])
+        tar = _get_tar(shard)
+        label = json.loads(self._read_member(
+            tar, self._f_json_offset[fi],
+            self._f_json_size[fi]).decode('utf-8'))
+        webp_buf = self._read_member(
+            tar, self._f_webp_offset[fi], self._f_webp_size[fi])
+        mask_buf = self._read_member(
+            tar, self._f_mask_offset[fi], self._f_mask_size[fi])
 
         img_pair = cv2.imdecode(
             np.frombuffer(webp_buf, np.uint8), cv2.IMREAD_COLOR)  # BGR
@@ -479,15 +505,6 @@ class StereobjDataset(PoseDataset):
         y1, y2 = bbox_entry['y_min'], bbox_entry['y_max']
         bbox_xyxy = np.array([x1, y1, x2, y2], dtype=np.float32)
 
-        # Photometric augmentation (same path as BOP_Dataset).
-        if (self.split in ('train', 'finetune')
-                and np.random.rand() < self.COLOR_AUG_PROB):
-            image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-            mask_t = torch.from_numpy(mask).unsqueeze(0).float()
-            augmented = self.color_augmentor({'image': image_t, 'mask': mask_t})
-            image = (augmented['image'] * 255.0).permute(1, 2, 0).numpy().astype(np.float32)
-            mask = augmented['mask'][0].numpy().astype(np.uint8)
-
         # DZI crop (same as BOP_Dataset).
         if self.split in ('train', 'finetune'):
             bbox_center, bbox_scale, bbox_loc = misc.aug_bbox_DZI(
@@ -525,6 +542,15 @@ class StereobjDataset(PoseDataset):
             image, bbox_center, bbox_scale, self.rgb_size, cam_K, rot_rad,
             interpolation='bilinear') / 255.0
 
+        # Photometric augmentation on the crop (post-crop is the default
+        # convention: noise/blur/erasing statistics are object-relative and
+        # the 256x256 tensor is ~15x cheaper than the full-res eye). The
+        # mask is untouched: torchvision v2 passes Mask inputs through the
+        # photometric transforms and RandomErasing alike.
+        if (self.split in ('train', 'finetune')
+                and np.random.rand() < self.COLOR_AUG_PROB):
+            roi_img = self.color_augmentor(roi_img)
+
         T_rot = cam_K @ Rz @ np.linalg.inv(cam_K)
         center_hom = T_rot @ np.array([*bbox_center, 1.0], dtype=np.float32)
         bbox_center = center_hom[:2]
@@ -558,8 +584,13 @@ class StereobjDataset(PoseDataset):
             'rot_index': rot_index,
         }
 
-    def _assemble_sample(self, fi, row, eye, eye_out, quat_bin):
-        """Build the left-frame PoseSample dict from one eye's crop output."""
+    def _assemble_sample(self, fi, row, eye, eye_out):
+        """Build the left-frame PoseSample dict from one eye's crop output.
+
+        ``quat_bin`` is intentionally absent: the trainer computes the bin
+        distribution for the whole batch on GPU (see
+        ``compute_quat_bin_targets``).
+        """
         return {
             'roi_image': eye_out['roi_image'],
             'bbox_map': eye_out['bbox_map'],
@@ -569,7 +600,6 @@ class StereobjDataset(PoseDataset):
             'roi_obj_R': torch.as_tensor(eye_out['R'], dtype=torch.float32),
             'roi_obj_t': torch.as_tensor(eye_out['t'], dtype=torch.float32),
             'roi_mask': eye_out['roi_mask'],
-            'quat_bin': torch.as_tensor(quat_bin, dtype=torch.float32),
             # numeric object id (class index + 1), mirroring BOP ids
             'obj_id': int(self._i_cls[row]) + 1,
             'scene_id': int(self._f_scene_id[fi]) * 2 + EYE_KEYS.index(eye),
@@ -581,10 +611,7 @@ class StereobjDataset(PoseDataset):
         label, img_pair, mask_full = self._load_frame_arrays(fi)
         eye_out = self._read_eye(
             fi, row, eye, label, img_pair, mask_full, None)
-        obj_name = self.cls_names[self._i_cls[row]]
-        quat_bin = self._compute_quat_bin(obj_name, eye_out['R'],
-                                          eye_out['rot_index'])
-        return self._assemble_sample(fi, row, eye, eye_out, quat_bin)
+        return self._assemble_sample(fi, row, eye, eye_out)
 
     def read_data_stereo(self, fi, row):
         """Build a stereo PoseSample: left-eye targets + right-eye inputs.
@@ -601,9 +628,7 @@ class StereobjDataset(PoseDataset):
         right = self._read_eye(
             fi, row, 'right', label, img_pair, mask_full, rot_index)
 
-        obj_name = self.cls_names[self._i_cls[row]]
-        quat_bin = self._compute_quat_bin(obj_name, left['R'], rot_index)
-        sample = self._assemble_sample(fi, row, 'left', left, quat_bin)
+        sample = self._assemble_sample(fi, row, 'left', left)
 
         rot_rad = rot_index * np.pi / 2
         Rz = np.array([[np.cos(rot_rad), -np.sin(rot_rad), 0.0],
@@ -622,50 +647,49 @@ class StereobjDataset(PoseDataset):
         })
         return sample
 
-    # ------------------------------------------------------------------ #
-    # Quaternion labels (lazy; stereobj-1m is far too large to precompute)
-    # ------------------------------------------------------------------ #
-    def _compute_quat_bin(self, obj_name, obj_R, rot_index):
-        """(N_POSE_BIN,) label for the given Rz-composed rotation.
 
-        Mirrors the per-instance rows ``BOP_Dataset`` precomputes, but
-        stereobj-1m has far too many instances for an (N, 4, N_POSE_BIN)
-        table, so the bin distribution is quantized on demand (CPU, ~0.2
-        s/sample, parallelized by the DataLoader workers).
-        """
-        cls = self.dataset_id2cls[obj_name]
-        registry = self.registry
-        num_v = int(registry.quant_points_mask[cls].sum().item())
-
-        verts = registry.quant_points[cls][:num_v]
-        vmask = registry.quant_points_mask[cls][:num_v]
-        diam = registry.diameter[cls]
-        vcorr = registry.quant_correlation[cls]
-        qsym = registry.quaternion_symmetries[cls]
-        tsym = registry.translation_symmetries[cls]
-        smask = registry.symmetries_mask[cls]
-
-    # Compute ONLY the single Rz matrix for rot_index
-        r = rot_index * np.pi / 2
-        rz = np.array([[np.cos(r), -np.sin(r), 0.],
-                   [np.sin(r),  np.cos(r), 0.],
-                   [0.,         0.,        1.]], dtype=np.float32)
-
-        composed = rz @ obj_R  # (3, 3) matrix multiplication
-
-        # Add batch dim of 1 instead of 4
-        quats = utils.rotation_to_quaternion(torch.from_numpy(composed[None]))
-
-        cats, _, _ = utils.quantize_quaternion_vertex(
-            quats,
-            verts[None],
-            vmask[None],
-            diam[None],
-            vcorr[None],
-            qsym[None],
-            tsym[None],
-            smask[None]
-        )
+# ---------------------------------------------------------------------- #
+# Quaternion labels (computed by the trainer, batched on GPU)
+# ---------------------------------------------------------------------- #
+# Chunking mirrors BOP_Dataset's GPU label generator: one sample of the
+# inner computation materializes (N, N_POSE_BIN, V, 3).
+QUAT_LABEL_MEM_BUDGET = 3_000_000_000
+QUAT_LABEL_CHUNK_MAX = 16
 
 
-        return cats[0].numpy()
+def compute_quat_bin_targets(registry, obj_cls, R):
+    """(N, N_POSE_BIN) quat-bin label distribution for a batch, on GPU.
+
+    Called by the trainer when the dataset adapter does not ship
+    ``quat_bin`` (stereobj-1m). Labels are quantized from the sample's
+    Rz-composed rotation ``R`` (the same convention ``BOP_Dataset``
+    precomputes), so no further Rz composition is applied here.
+
+    ``registry`` is the dataset's ``ObjectRegistry``; its buffers are
+    moved to the tensors' device once and stay there.
+    """
+    device = R.device
+    registry = registry.to(device)
+    cls = obj_cls.to(device)
+
+    num_v = int(registry.quant_points.shape[1])
+    num_s = int(registry.symmetries_mask.shape[1])
+    per_sample = cfg.N_POSE_BIN * (num_v * 3 + num_s * 13) * 4
+    chunk = max(1, min(QUAT_LABEL_CHUNK_MAX,
+                       QUAT_LABEL_MEM_BUDGET // max(per_sample, 1)))
+
+    quats = utils.rotation_to_quaternion(R)
+    categories = []
+    for start in range(0, len(quats), chunk):
+        rows = slice(start, start + chunk)
+        cat, _, _ = utils.quantize_quaternion_vertex(
+            quats[rows],
+            registry.quant_points[cls[rows]],
+            registry.quant_points_mask[cls[rows]],
+            registry.diameter[cls[rows]],
+            registry.quant_correlation[cls[rows]],
+            registry.quaternion_symmetries[cls[rows]],
+            registry.translation_symmetries[cls[rows]],
+            registry.symmetries_mask[cls[rows]])
+        categories.append(cat)
+    return torch.cat(categories, dim=0).float()
