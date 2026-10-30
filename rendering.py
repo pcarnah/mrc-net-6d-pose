@@ -134,7 +134,8 @@ class Pytorch3DRenderer:
             direction=light_direction, device=device)
 
         raster_settings = p3d_renderer.RasterizationSettings(
-            image_size=image_size, blur_radius=0.0, faces_per_pixel=1)
+            image_size=image_size, blur_radius=0.0, faces_per_pixel=1,
+            bin_size=0)
         rasterizer = p3d_renderer.MeshRasterizer(
             cameras=cameras, raster_settings=raster_settings)
         shader = p3d_renderer.HardPhongShader(
