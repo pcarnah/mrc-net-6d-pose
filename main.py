@@ -1,4 +1,5 @@
 import os
+import warnings
 import cv2
 import dataclasses
 import torch
@@ -16,6 +17,33 @@ import torch.distributed as dist
 from lib import warmup_lr
 import config as bop_cfg
 
+def match_weight_dict(d1, d2):
+    matched = {}
+
+    for k, v in d2.items():
+        if k not in d1:
+            warnings.warn(
+                f"Key '{k}' missing from checkpoint, using target weights "
+                f"(likely random initialization)."
+            )
+            matched[k] = v
+        elif v.size() != d1[k].size():
+            warnings.warn(
+                f"Shape mismatch for '{k}': checkpoint {tuple(d1[k].size())} "
+                f"vs target {tuple(v.size())}. Using target weights instead."
+            )
+            matched[k] = v
+        else:
+            matched[k] = d1[k]
+
+    for k in d1:
+        if k not in d2:
+            warnings.warn(
+                f"Key '{k}' from checkpoint not present in target state_dict, "
+                f"skipping."
+            )
+
+    return matched
 
 def worker_init_fn(*_):
     # each worker should only use one os thread
@@ -86,6 +114,7 @@ def main_worker(rank, world_size, args):
             weights_only=True)
         print('loading pre-trained model from {}'.format(args.pretrained))
         network = checkpoint['network']
+        network = match_weight_dict(network, model.state_dict())
         try:
             model.load_state_dict(network)
             print('  loaded strictly (all keys matched).')

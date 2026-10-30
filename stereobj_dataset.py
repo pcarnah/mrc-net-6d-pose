@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 cv2.setNumThreads(0)
 
-SCHEMA_VERSION = 'stereobj-v2'
+SCHEMA_VERSION = 'stereobj-v3'
 
 # camera.json projection matrix was defined on this canvas; the webds
 # converter resized it to (WEBDS_W, WEBDS_H).
@@ -103,6 +103,28 @@ def _get_tar(shard_path):
             _, evicted = _TAR_CACHE.popitem(last=False)
             evicted.close()
     return tar
+
+
+def _bbox_ok(entry):
+    """True when a ``scaled_bboxes`` entry is finite and non-degenerate.
+
+    A missing/NaN/zero-area box makes ``aug_bbox_DZI`` divide by a zero
+    scale (``bh / scale`` -> NaN ``bbox_loc``), which later crashes
+    ``utils.make_roi`` with ``cannot convert float NaN to integer``.
+    Such instances are dropped at index build time.
+    """
+    if entry is None:
+        return False
+    try:
+        x1 = float(entry['x_min'])
+        y1 = float(entry['y_min'])
+        x2 = float(entry['x_max'])
+        y2 = float(entry['y_max'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(np.isfinite(v) for v in (x1, y1, x2, y2)):
+        return False
+    return (x2 - x1) > 0 and (y2 - y1) > 0
 
 
 class StereobjDataset(PoseDataset):
@@ -421,7 +443,7 @@ class StereobjDataset(PoseDataset):
                 continue
             sides = 0
             for eye_i, eye in enumerate(EYE_KEYS):
-                if boxes.get(eye, {}).get(obj_key) is not None:
+                if _bbox_ok(boxes.get(eye, {}).get(obj_key)):
                     sides |= 1 << eye_i
             if sides == 0:
                 continue
@@ -504,6 +526,11 @@ class StereobjDataset(PoseDataset):
         x2 = bbox_entry['x_max'] - x_off
         y1, y2 = bbox_entry['y_min'], bbox_entry['y_max']
         bbox_xyxy = np.array([x1, y1, x2, y2], dtype=np.float32)
+        if not (np.isfinite(bbox_xyxy).all()
+                and x2 > x1 and y2 > y1):
+            raise ValueError(
+                'stereobj: invalid {} bbox for {} in frame {}: {}'.format(
+                    eye, obj_key, self._f_image_id[fi], bbox_entry))
 
         # DZI crop (same as BOP_Dataset).
         if self.split in ('train', 'finetune'):
