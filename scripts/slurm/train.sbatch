@@ -6,6 +6,8 @@
 #SBATCH --mem=60G
 #SBATCH --output=logs/slurm/%x-%j.out
 #SBATCH --error=logs/slurm/%x-%j.err
+#SBATCH --mail-user=pcarnah@uwo.ca
+#SBATCH --mail-type=ALL
 
 # Generic MRC-Net training job.  All configuration is passed through the
 # environment so `submit_training.sh` can fan out the matrix; every value has a

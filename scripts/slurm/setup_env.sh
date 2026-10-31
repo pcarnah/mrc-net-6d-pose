@@ -28,7 +28,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 : "${SLURM_TMPDIR:?setup_env.sh requires SLURM_TMPDIR (run under sbatch)}"
 
-module load python/3.12 opencv/4.10 cuda/13.2 cudnn
+module load python/3.12 opencv/4.10 cuda/13.2 cudnn vtk
 
 # Torch hub cache: compute nodes have no internet, so point torch at the
 # pre-populated cache on scratch for any pretrained backbone weights.

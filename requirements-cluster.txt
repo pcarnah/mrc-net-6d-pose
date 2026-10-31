@@ -10,7 +10,7 @@
 # the per-job venv (see scripts/slurm/setup_env.sh), so the package-index lines
 # from requirements.txt are intentionally omitted and everything resolves from
 # the module wheelhouse.
-torch==2.11.0
+torch==2.12.0
 torchvision
 kornia
 numpy
