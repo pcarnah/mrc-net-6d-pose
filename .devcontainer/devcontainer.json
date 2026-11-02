@@ -69,7 +69,7 @@
 	// The volume is created root-owned; hand it to `vscode`, then run the repo's
 	// Linux dependency script (creates .venv with Python 3.13, installs
 	// requirements.txt + ../bop_toolkit).
-	"postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cache/kilo /home/vscode/.local /home/vscode/.cache/uv /workspaces/mrc-net-6d-pose/.venv && bash scripts/install_devcontainer.sh",
+	"postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cache /home/vscode/.local /workspaces/mrc-net-6d-pose/.venv && bash scripts/install_devcontainer.sh",
 
 	"remoteUser": "vscode",
 
