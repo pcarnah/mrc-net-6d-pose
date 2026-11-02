@@ -69,14 +69,14 @@ def make_warmup_batch(stereo=False):
 
 
 def build_rz_crop_batch(view_image, view_cam_K, det_bbox, box_scale,
-                        cx, cy, fx, fy, dataset_id2cls, inst_cls):
+                        cx, cy, fx, fy, dataset_id2cls, inst_cls, n_rots=4):
     x1, y1, x2, y2 = det_bbox
     hr = (y2 - y1) / box_scale
     wr = (x2 - x1) / box_scale
 
     b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov \
         = [], [], [], [], [], []
-    for rot_index in range(4):
+    for rot_index in range(n_rots):
         rot_rad = rot_index * np.pi / 2
         bbox_center = torch.as_tensor([cx, cy], dtype=torch.float32)
         bbox_loc = np.array(
@@ -206,6 +206,10 @@ if __name__ == '__main__':
                         help='perturb the iteration-0 bootstrap translation by '
                              'up to this fraction of depth (robustness study)')
     parser.add_argument('--no_compile', action='store_true')
+    parser.add_argument('--single_crop', action='store_true',
+                        help='evaluate only the rot_index=0 crop instead of '
+                             'argmax over the 4 Rz crops (use when the '
+                             'classification confidence is miscalibrated)')
     parser.add_argument('--max_instances', type=int, default=0,
                         help='debug cap on the number of instances (0 = all)')
     parser.add_argument('--dataset_root', type=str, default=None,
@@ -367,12 +371,16 @@ if __name__ == '__main__':
                 b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
                     build_rz_crop_batch(
                         left_image, K_left, box_l, scale_l, cx_l, cy_l,
-                        fx_l, fy_l, dataset_id2cls, inst_cls)
+                        fx_l, fy_l, dataset_id2cls, inst_cls,
+                        n_rots=1 if args.single_crop else 4)
                 _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
                     build_rz_crop_batch(
                         right_image, K_right, box_r, scale_r, cx_r, cy_r,
-                        fx_r, fy_r, dataset_id2cls, inst_cls)
-                T_right_ref = np.tile(np.eye(4, dtype=np.float32), (4, 1, 1))
+                        fx_r, fy_r, dataset_id2cls, inst_cls,
+                        n_rots=1 if args.single_crop else 4)
+                T_right_ref = np.tile(
+                    np.eye(4, dtype=np.float32),
+                    (b_Rz.shape[0], 1, 1))
                 T_right_ref[:, :3, 3] = -np.einsum(
                     'nij,j->ni', b_Rz,
                     np.array([baseline, 0.0, 0.0], dtype=np.float32))
@@ -394,7 +402,8 @@ if __name__ == '__main__':
                 b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
                     build_rz_crop_batch(
                         view_image, view_K, box, scale, cx, cy, fx, fy,
-                        dataset_id2cls, inst_cls)
+                        dataset_id2cls, inst_cls,
+                        n_rots=1 if args.single_crop else 4)
                 (est_R, est_t), _run_time = timed(lambda: inference_func(
                     net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
                     b_roi_camK, b_fov, b_Rz,

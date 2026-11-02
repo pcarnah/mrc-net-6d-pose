@@ -101,9 +101,16 @@ def load_symmetries(dataset_name, override_path):
     """name -> list of 4x4 symmetry transforms (identity always included)."""
     path = override_path
     if path is None:
-        cand = os.path.join(cfg.DATASET_ROOT, dataset_name, 'symmetries.json')
-        if os.path.exists(cand):
-            path = cand
+        cands = [
+            os.path.join(cfg.DATASET_ROOT, dataset_name, 'symmetries.json'),
+            # registry fallback location (next to the model files)
+            os.path.join(cfg.DATASET_ROOT, dataset_name, 'objects',
+                         'symmetries.json'),
+        ]
+        for cand in cands:
+            if os.path.exists(cand):
+                path = cand
+                break
     syms = {}
     if path and os.path.exists(path):
         with open(path, 'r') as fp:

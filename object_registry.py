@@ -87,6 +87,28 @@ class ObjectRegistry(nn.Module):
             diameter = float(fp.read().strip())
         info = {'diameter': diameter,  # metres, matches mesh/pose units
                 'quant_points': quant_pts}
+        # Symmetry group for the loss disambiguation (top_matched_pose).
+        # Looked up next to the objects dir, in the objects dir, and as a
+        # repo-local fallback (data/symmetries/<dataset>.json); entries are
+        # flat 4x4 transforms in the model frame.
+        sym_table = None
+        for sym_dir in (os.path.dirname(self.model_folder),
+                        self.model_folder):
+            sym_path = os.path.join(sym_dir, 'symmetries.json')
+            if os.path.exists(sym_path):
+                with open(sym_path, 'r') as fp:
+                    sym_table = json.load(fp)
+                break
+        if sym_table is None:
+            repo_fallback = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'data',
+                'symmetries', '{}.json'.format(self.dataset_name))
+            if os.path.exists(repo_fallback):
+                with open(repo_fallback, 'r') as fp:
+                    sym_table = json.load(fp)
+        if sym_table is not None and obj_name in sym_table \
+                and sym_table[obj_name]:
+            info['symmetries_discrete'] = sym_table[obj_name]
         return mesh, info
 
     def _maybe_decimate(self, mesh):
