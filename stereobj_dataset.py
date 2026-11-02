@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 cv2.setNumThreads(0)
 
-SCHEMA_VERSION = 'stereobj-v3'
+SCHEMA_VERSION = 'stereobj-v4'
 
 # camera.json projection matrix was defined on this canvas; the webds
 # converter resized it to (WEBDS_W, WEBDS_H).
@@ -316,7 +316,14 @@ class StereobjDataset(PoseDataset):
     # Camera
     # ------------------------------------------------------------------ #
     def _load_camera(self):
-        """Per-eye 3x3 intrinsics on the webds canvas + baseline (m)."""
+        """Per-eye 3x3 EYE-LOCAL intrinsics + baseline (m).
+
+        The cx is the principal point within each eye's own image.  (An
+        earlier version added EYE_W to the right eye's cx, i.e. canvas
+        coordinates; composing that with the eye-local crop centre mixed
+        reference frames and broke every right-eye sample's translation
+        target and render.)
+        """
         import json
         cam_path = os.path.join(self.data_dir, 'camera.json')
         if os.path.exists(cam_path):
@@ -338,7 +345,7 @@ class StereobjDataset(PoseDataset):
             P = np.asarray(entry['P'], dtype=np.float64)
             fx = P[0, 0] * sx
             fy = P[1, 1] * sy
-            cx = P[0, 2] * sx + (EYE_W if side == 'right' else 0.0)
+            cx = P[0, 2] * sx
             cy = P[1, 2] * sy
             K = np.array([[fx, 0, cx],
                           [0, fy, cy],
@@ -351,8 +358,8 @@ class StereobjDataset(PoseDataset):
 
     @property
     def baseline(self):
-        """Stereo baseline in metres (right-cam pose offset)."""
-        return self._camera['right']['baseline_m']
+        """Stereo baseline in millimetres (right-cam pose offset)."""
+        return self._camera['right']['baseline_m'] * 1000.0
 
     def eye_intrinsics(self, eye):
         return self._camera[eye]['K']
@@ -508,8 +515,10 @@ class StereobjDataset(PoseDataset):
         # Pose: json rt is in the left-camera frame. The right camera sits
         # at +baseline along x, so its pose composes as t_r = t_l - [b,0,0]
         # (mirrored by P_right = [K | -fx*b] in camera.json).
+        # The index stores translations in metres (annotation-native); the
+        # sample contract is BOP-standard millimetres.
         R = self._i_R[row].copy()
-        t = self._i_t[row].copy()
+        t = self._i_t[row].copy() * 1000.0
         if eye == 'right':
             t = t - np.array([self.baseline, 0.0, 0.0], dtype=np.float32)
 

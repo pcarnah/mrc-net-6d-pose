@@ -71,9 +71,16 @@ class ObjectRegistry(nn.Module):
         self._build()
 
     def _load_stereobj_model(self, obj_name):
-        """Load one stereobj-1m object; returns (mesh, model_info)."""
+        """Load one stereobj-1m object; returns (mesh, model_info).
+
+        The stereobj CAD is authored in metres; the pipeline runs in
+        BOP-standard millimetres, so every geometry carrier (mesh
+        vertices, diameter, quantization points, symmetry translations)
+        is scaled x1000 here.
+        """
         mesh = trimesh.load(os.path.join(
             self.model_folder, '{}.obj'.format(obj_name)))
+        mesh.vertices = mesh.vertices * 1000.0
         # The .xyz sidecar holds 2048 uniformly-sampled model points; use
         # them for quat-label quantization (full meshes are 10k+ verts and
         # blow up the (N, bins, V, 3) intermediate).
@@ -81,11 +88,12 @@ class ObjectRegistry(nn.Module):
         quant_pts = (np.loadtxt(xyz_path, dtype=np.float32)
                      if os.path.exists(xyz_path) else
                      mesh.vertices.astype(np.float32))
+        quant_pts = quant_pts * 1000.0
         with open(os.path.join(
                 self.model_folder,
                 '{}.diameter'.format(obj_name)), 'r') as fp:
-            diameter = float(fp.read().strip())
-        info = {'diameter': diameter,  # metres, matches mesh/pose units
+            diameter = float(fp.read().strip()) * 1000.0
+        info = {'diameter': diameter,  # mm, matches mesh/pose units
                 'quant_points': quant_pts}
         # Symmetry group for the loss disambiguation (top_matched_pose).
         # Looked up next to the objects dir, in the objects dir, and as a
@@ -108,7 +116,14 @@ class ObjectRegistry(nn.Module):
                     sym_table = json.load(fp)
         if sym_table is not None and obj_name in sym_table \
                 and sym_table[obj_name]:
-            info['symmetries_discrete'] = sym_table[obj_name]
+            # Translations in the file are in mesh-native metres; scale to
+            # the pipeline's millimetres (rotations are unitless).
+            sym_discrete = []
+            for flat in sym_table[obj_name]:
+                T = np.asarray(flat, dtype=np.float64).reshape(4, 4).copy()
+                T[:3, 3] *= 1000.0
+                sym_discrete.append(T.flatten().tolist())
+            info['symmetries_discrete'] = sym_discrete
         return mesh, info
 
     def _maybe_decimate(self, mesh):

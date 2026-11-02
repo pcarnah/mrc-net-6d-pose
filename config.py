@@ -198,6 +198,12 @@ DATASET_CONFIG = {
         'width': 1000,
         'height': 1000,
         'color_type': 'rgb',
+        # Depth-bin range in NORMALIZED depth units (z/fx), matching the
+        # BOP datasets' convention (their t is in mm, so mm/px values like
+        # 0.01-2.15 are already normalized). stereobj-1m t is converted to
+        # millimetres in the adapter and fx = 1408.83 px, so a scene depth
+        # of 0.1-2.0 m is z/fx in [0.071, 1.42]. (The first training runs
+        # used metres end-to-end, which put every GT depth in bin 0.)
         'Tz_near': 0.100,
         'Tz_far': 2.000,
         'num_class': 18,

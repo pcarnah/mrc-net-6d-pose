@@ -79,7 +79,9 @@ def build_gt(ds, stereo):
         cls = int(ds._i_cls[row])
         obj_id = cls + 1
         R = np.asarray(ds._i_R[row], dtype=np.float64)
-        t = np.asarray(ds._i_t[row], dtype=np.float64)
+        # index translations are annotation-native metres; scoring is in
+        # BOP-standard millimetres (predictions are written in mm too)
+        t = np.asarray(ds._i_t[row], dtype=np.float64) * 1000.0
         if stereo:
             if sides != 0b11:
                 continue
@@ -118,6 +120,11 @@ def load_symmetries(dataset_name, override_path):
         for name, mats in raw.items():
             syms[name] = [np.asarray(m, dtype=np.float64).reshape(4, 4)
                           for m in mats]
+        # the file stores mesh-native (metre) translations; the registry
+        # scales its copy to mm, so scale here too (rotations unitless)
+        for name in syms:
+            for T in syms[name]:
+                T[:3, 3] *= 1000.0
     return syms
 
 
