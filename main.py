@@ -89,7 +89,8 @@ def main_worker(rank, world_size, args):
         args.dataset, split='train')
 
     model_config = bop_cfg.ModelConfig.from_dataset_config(
-        args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion)
+        args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion,
+        fusion_residual=True if args.fusion_residual else None)
 
     if args.is_parallel:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset)
@@ -329,6 +330,12 @@ if __name__ == '__main__':
                         choices=list(bop_cfg.FUSION_MODES),
                         help='stereo fusion operation (only meaningful when '
                              'stereo_mode=stereo; default cross_view)')
+    parser.add_argument('--fusion_residual', action='store_true',
+                        help='use residual cross-view fusion: reg_pool = '
+                             'left + zero-init conv(cat(left, right)) instead '
+                             'of ConvGnReLU(cat(left, right)). The zero init '
+                             'starts the stereo branch at mono performance. '
+                             'Checkpoints record the flag in model_config.')
     parser.add_argument('--seed', type=int, default=bop_cfg.RANDOM_SEED,
                         help='random seed (single-seed study by default)')
     parser.add_argument('--no_compile', action='store_true',

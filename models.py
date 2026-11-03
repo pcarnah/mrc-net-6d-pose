@@ -380,17 +380,35 @@ class MRCNet(nn.Module):
         self.n_pose_bin = cfg.n_pose_bin
         self.use_6d = cfg.use_6d
 
-        # Two-view residual fusion. ``stereo_fuse`` concatenates the two
-        # views' ``reg_pool`` features (left first) and projects back to the
-        # mono regressor width; new parameters live only in ``stereo_fuse.*``
-        # so mono state_dicts stay bit-for-bit identical.
+        # Two-view residual fusion. When ``fusion_residual`` is False (default,
+        # matches existing stereo checkpoints), ``stereo_fuse`` is a
+        # ConvGnReLU over the concatenated views' ``reg_pool`` features
+        # (left first). When True, the fused tensor is left + GN(conv(cat))
+        # with the GN gamma/beta zeroed, so at init the fused tensor equals
+        # the left view exactly and the stereo branch starts at mono
+        # performance. New parameters live only in ``stereo_fuse.*`` so
+        # mono state_dicts stay bit-for-bit identical either way.
         self.stereo_fusion = bool(getattr(cfg, 'stereo_fusion', False))
         self.fusion_mode = getattr(cfg, 'fusion_mode', 'cross_view')
+        self.fusion_residual = bool(getattr(cfg, 'fusion_residual', False))
         if self.stereo_fusion:
             # Always built for stereo models so state_dicts are interchangeable
             # across fusion variants (left_only/right_only/mean simply bypass
             # it); only cross_view uses it.
-            self.stereo_fuse = ConvGnReLU(4096, 2048, kernel_size=3, padding=1)
+            if self.fusion_residual:
+                # Residual branch: delta = gamma * GN(conv(cat(left, right)))
+                # with gamma/beta zeroed, so delta == 0 at init and the fused
+                # tensor equals the left view exactly (the conv keeps its
+                # default init; gamma receives the first gradient).
+                self.stereo_fuse = nn.Sequential(
+                    nn.Conv2d(4096, 2048, kernel_size=3, padding=1,
+                              bias=False),
+                    nn.GroupNorm(32, 2048))
+                nn.init.zeros_(self.stereo_fuse[1].weight)
+                nn.init.zeros_(self.stereo_fuse[1].bias)
+            else:
+                self.stereo_fuse = ConvGnReLU(
+                    4096, 2048, kernel_size=3, padding=1)
 
     def _make_predictions(self, mask_real, mask_synt, pose_logits,
                           depth_logits, trans_logits, pose_res,
@@ -513,8 +531,17 @@ class MRCNet(nn.Module):
                 x_reg = {'reg_pool': reg_pool, 'fov': fov_left}
                 pose_res, depth_res, trans_res = self.regressor(x_reg)
             else:  # cross_view (default)
-                reg_pool = self.stereo_fuse(torch.cat(
-                    [x_reg_left['reg_pool'], x_reg_right['reg_pool']], dim=1))
+                if self.fusion_residual:
+                    # Residual fusion: left + zero-init conv(cat(left, right)).
+                    # Zero init keeps the fused tensor equal to the left view
+                    # at init; the conv learns the cross-view correction.
+                    reg_pool = x_reg_left['reg_pool'] + self.stereo_fuse(
+                        torch.cat([x_reg_left['reg_pool'],
+                                   x_reg_right['reg_pool']], dim=1))
+                else:
+                    reg_pool = self.stereo_fuse(torch.cat(
+                        [x_reg_left['reg_pool'],
+                         x_reg_right['reg_pool']], dim=1))
                 x_reg = {'reg_pool': reg_pool, 'fov': fov_left}
                 pose_res, depth_res, trans_res = self.regressor(x_reg)
 

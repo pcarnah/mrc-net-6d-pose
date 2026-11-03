@@ -318,9 +318,16 @@ class ModelConfig:
     # Defaults to the main model's learned cross-view concat so old stereo
     # checkpoints (which predate this field) rebuild identically.
     fusion_mode: str = DEFAULT_FUSION_MODE
+    # Residual cross-view fusion: reg_pool = left + zero-init
+    # conv(cat(left, right)) instead of ConvGnReLU(cat(left, right)). The
+    # zero init makes the fused tensor equal the left view at init, so the
+    # stereo branch starts at mono performance. Defaults to False so old
+    # stereo checkpoints (ConvGnReLU fusion) rebuild and load identically.
+    fusion_residual: bool = False
 
     @classmethod
-    def from_dataset_config(cls, dataset, stereo_mode=None, fusion=None):
+    def from_dataset_config(cls, dataset, stereo_mode=None, fusion=None,
+                            fusion_residual=None):
         dataset_cfg = DATASET_CONFIG[dataset]
         stereo = dataset_cfg.get('stereo_fusion', False)
         if stereo_mode is not None:
@@ -328,6 +335,9 @@ class ModelConfig:
         fusion_mode = dataset_cfg.get('fusion_mode', DEFAULT_FUSION_MODE)
         if fusion is not None:
             fusion_mode = fusion
+        residual = dataset_cfg.get('fusion_residual', False)
+        if fusion_residual is not None:
+            residual = fusion_residual
         return cls(
             dataset=dataset,
             n_decoders=dataset_cfg['num_class'],
@@ -335,7 +345,8 @@ class ModelConfig:
             depth_max=dataset_cfg['Tz_far'],
             n_depth_bin=Tz_BINS_NUM,
             stereo_fusion=stereo,
-            fusion_mode=fusion_mode)
+            fusion_mode=fusion_mode,
+            fusion_residual=residual)
 
 
 def set_runtime_overrides(dataset, stereo_mode=None, fusion=None):
