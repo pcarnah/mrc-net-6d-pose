@@ -228,6 +228,11 @@ DATASET_CONFIG = {
             'test': 'objects'},
         'loader': 'webds',
         'webds_dir': 'webds',
+        # Residual cross-view fusion by default for new training runs
+        # (reg_pool = left + GN(conv(cat)); GN gamma/beta zero-init). Old
+        # checkpoints carry fusion_residual=False in their model_config and
+        # keep building the ConvGnReLU fusion.
+        'fusion_residual': True,
         'train_set': ['train'],
         'finetune_set': ['train'],
         # webds test shards carry images only (no labels); the annotated
