@@ -23,9 +23,11 @@
 #   TORCH_HOME  writable torch-hub cache  (default: /tmp/kilo/torch)
 #   PYTHON      interpreter               (default: <repo>/.venv/bin/python;
 #                                         on Windows use .venv/Scripts/python.exe)
+#   CROP        single | multi            (default: single). multi re-enables the
+#                                         4-crop confidence argmax selection.
 #
-# Inference always runs with --single_crop --no_compile (the 4-crop
-# confidence argmax is miscalibrated; see reports/ history).
+# Inference runs with --no_compile always, and --single_crop unless CROP=multi
+# (the 4-crop confidence argmax is miscalibrated; see reports/ history).
 
 set -euo pipefail
 
@@ -46,6 +48,12 @@ DATA_ROOT="${DATA_ROOT:-/workspaces/datasets}"
 EVAL_ROOT="${EVAL_ROOT:-$REPO_DIR/reports}"
 TORCH_HOME="${TORCH_HOME:-/tmp/kilo/torch}"
 PYTHON="${PYTHON:-$REPO_DIR/.venv/bin/python}"
+CROP="${CROP:-single}"
+
+crop_flags=()
+if [ "$CROP" != "multi" ]; then
+    crop_flags+=(--single_crop)
+fi
 
 ckpt_dir="$CKPT_ROOT/$CKPT_SUBDIR"
 if [ ! -d "$ckpt_dir" ]; then
@@ -68,7 +76,7 @@ TORCH_HOME="$TORCH_HOME" "$PYTHON" "$REPO_DIR/inference_stereobj.py" \
     --dataset stereobj-1m --split val \
     --checkpoint_name "$CKPT_SUBDIR" --model_name "$MODEL" \
     --output_suffix "$tag" --stereo_mode "$MODE" \
-    --max_instances "$N" --single_crop --no_compile \
+    --max_instances "$N" --no_compile "${crop_flags[@]}" \
     --dataset_root "$DATA_ROOT" --eval_root "$EVAL_ROOT"
 
 echo "== scoring =="
