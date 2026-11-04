@@ -205,6 +205,15 @@ full-train as the upper bound. One epoch per arm is likely enough signal; if
 extended, extend all arms identically.
 
 **Gotchas.**
+- **Eval batch composition changes results.** The backbone's BatchNorm is
+  built with `track_running_stats=False`, which normalizes over the batch
+  **even in eval** — predictions depend on what else is in the batch
+  (measured: the same instance alone vs batched with another differs by
+  ~0.08 in `quat_bin` logits and O(100 mm) in pose after the 4-crop argmax
+  flips). The per-instance 4-crop batch is the calibrated eval unit; never
+  batch instances together at inference, and note `--single_crop` (1-crop
+  batches) also shifts the operating point. Throughput at eval comes from
+  `--num_workers` prefetch, not from larger GPU batches.
 - `--warmup_step` must be < steps/epoch; check the stereobj-1m step count at
   the chosen batch size before picking a value.
 - K=3 stereo OOM at batch 4 → `--refine_grad_ckpt` (safe without DDP).
