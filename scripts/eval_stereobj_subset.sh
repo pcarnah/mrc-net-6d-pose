@@ -25,6 +25,9 @@
 #                                         on Windows use .venv/Scripts/python.exe)
 #   CROP        single | multi            (default: single). multi re-enables the
 #                                         4-crop confidence argmax selection.
+#   NUM_WORKERS DataLoader workers for the CPU prep (default: 2). Overlaps
+#                                         decode + crop building with the GPU
+#                                         call; 0 = serial.
 #
 # Inference runs with --no_compile always, and --single_crop unless CROP=multi
 # (the 4-crop confidence argmax is miscalibrated; see reports/ history).
@@ -46,14 +49,15 @@ SUFFIX="${5:-}"
 CKPT_ROOT="${CKPT_ROOT:-$REPO_DIR/stereo_checkpoints}"
 DATA_ROOT="${DATA_ROOT:-/workspaces/datasets}"
 EVAL_ROOT="${EVAL_ROOT:-$REPO_DIR/reports}"
-TORCH_HOME="${TORCH_HOME:-/tmp/kilo/torch}"
 PYTHON="${PYTHON:-$REPO_DIR/.venv/bin/python}"
 CROP="${CROP:-single}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
 
 crop_flags=()
 if [ "$CROP" != "multi" ]; then
     crop_flags+=(--single_crop)
 fi
+worker_flags=(--num_workers "$NUM_WORKERS")
 
 ckpt_dir="$CKPT_ROOT/$CKPT_SUBDIR"
 if [ ! -d "$ckpt_dir" ]; then
@@ -72,11 +76,12 @@ mkdir -p "$EVAL_ROOT"
 
 echo "== inference: $CKPT_SUBDIR / $MODEL ($MODE, n=$N) =="
 cd "$CKPT_ROOT"
-TORCH_HOME="$TORCH_HOME" "$PYTHON" "$REPO_DIR/inference_stereobj.py" \
+"$PYTHON" "$REPO_DIR/inference_stereobj.py" \
     --dataset stereobj-1m --split val \
     --checkpoint_name "$CKPT_SUBDIR" --model_name "$MODEL" \
     --output_suffix "$tag" --stereo_mode "$MODE" \
     --max_instances "$N" --no_compile "${crop_flags[@]}" \
+    "${worker_flags[@]}" \
     --dataset_root "$DATA_ROOT" --eval_root "$EVAL_ROOT"
 
 echo "== scoring =="

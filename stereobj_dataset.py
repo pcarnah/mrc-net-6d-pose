@@ -94,6 +94,21 @@ TAR_CACHE_MAX = 64
 _TAR_CACHE = {}
 
 
+def _clear_tar_cache():
+    """Close and drop every cached tar handle.
+
+    Forked DataLoader workers inherit the parent's open file descriptions
+    (shared offsets), so a cache populated before fork races across
+    workers. Worker init calls this to force fresh per-worker handles.
+    """
+    for tar in _TAR_CACHE.values():
+        try:
+            tar.close()
+        except Exception:
+            pass
+    _TAR_CACHE.clear()
+
+
 def _get_tar(shard_path):
     tar = _TAR_CACHE.get(shard_path)
     if tar is None:

@@ -179,6 +179,150 @@ def inference_func(net, device, obj_cls, roi_rgb, bbox_loc, roi_camK, fov, Rz,
     return R_pred, t_pred
 
 
+def _prep_worker_init_fn(*_):
+    # mirror training's worker discipline: one thread per worker; drop any
+    # fork-inherited tar handles (shared file offsets race across workers)
+    import cv2
+    import stereobj_dataset
+    cv2.setNumThreads(0)
+    torch.set_num_threads(1)
+    stereobj_dataset._clear_tar_cache()
+
+
+def _first_item(batch):
+    return batch[0]
+
+
+class _PrepDataset(torch.utils.data.Dataset):
+    """Map over prep jobs; item ``i`` is job ``i``'s ``(payloads, stats)``."""
+
+    def __init__(self, jobs, preparer):
+        self.jobs = jobs
+        self.preparer = preparer
+
+    def __len__(self):
+        return len(self.jobs)
+
+    def __getitem__(self, idx):
+        return self.preparer(self.jobs[idx])
+
+
+def prep_jobs(jobs, preparer, num_workers=0):
+    """Yield ``(payloads, stats)`` per job, optionally prefetching the CPU
+    prep (decode + Rz crop building) in DataLoader workers so it overlaps
+    the GPU call. Order-preserving; ``num_workers=0`` runs the same
+    preparer inline (serial path)."""
+    if num_workers <= 0:
+        for job in jobs:
+            yield preparer(job)
+        return
+    loader = torch.utils.data.DataLoader(
+        _PrepDataset(jobs, preparer), batch_size=1, shuffle=False,
+        num_workers=num_workers, collate_fn=_first_item,
+        worker_init_fn=_prep_worker_init_fn)
+    for item in loader:
+        yield item
+
+
+class StereobjFramePreparer:
+    """Picklable per-frame prep for one ``(frame_index, [(row, eye)...])`` job.
+
+    Reuses the dataset's IO layer (``_load_frame_arrays``: cached tar handles
+    + decode) and builds the 4-way Rz crop batches for every instance,
+    returning one payload per instance: the ``inference_func`` keyword
+    arguments plus the CSV metadata. Picklable so DataLoader workers (fork or
+    spawn) can run it ahead of the GPU call.
+    """
+
+    def __init__(self, dataset, stereo, n_rots, dataset_id2cls):
+        self.dataset = dataset
+        self.stereo = stereo
+        self.n_rots = n_rots
+        self.dataset_id2cls = dataset_id2cls
+        self.baseline = dataset.baseline
+        self.eye_index = {'left': 0, 'right': 1}
+
+    def __call__(self, job):
+        ds = self.dataset
+        fi, items = job
+        label, img_pair, _mask = ds._load_frame_arrays(fi)
+        left_image = torch.as_tensor(
+            np.ascontiguousarray(img_pair[:, :ds.EYE_W]),
+            dtype=torch.float32)
+        right_image = torch.as_tensor(
+            np.ascontiguousarray(img_pair[:, ds.EYE_W:2 * ds.EYE_W]),
+            dtype=torch.float32)
+        img_H, img_W = left_image.shape[:2]
+        K_left = ds.eye_intrinsics('left')
+        K_right = ds.eye_intrinsics('right')
+        fx_l, fy_l = K_left[0, 0], K_left[1, 1]
+        fx_r, fy_r = K_right[0, 0], K_right[1, 1]
+        im_id = int(ds._f_image_id[fi])
+
+        payloads = []
+        for row, eye in items:
+            obj_key = 'Object {}'.format(int(ds._i_mask[row]) - 1)
+            inst_cls = torch.as_tensor(
+                int(ds._i_cls[row]), dtype=torch.int64)
+            inst_name = ds.cls_names[int(ds._i_cls[row])]
+
+            def eye_box(view_eye, x_off):
+                bb = label['scaled_bboxes'][view_eye][obj_key]
+                x1 = bb['x_min'] - x_off
+                x2 = bb['x_max'] - x_off
+                y1, y2 = bb['y_min'], bb['y_max']
+                cx = min((x1 + x2) / 2.0, img_W)
+                cy = min((y1 + y2) / 2.0, img_H)
+                bw = int(max(0, min(x2 - x1, img_W)))
+                bh = int(max(0, min(y2 - y1, img_H)))
+                return (x1, y1, x2, y2), \
+                    max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE, cx, cy
+
+            if self.stereo:
+                box_l, scale_l, cx_l, cy_l = eye_box('left', 0)
+                box_r, scale_r, cx_r, cy_r = eye_box('right', ds.EYE_W)
+                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
+                    build_rz_crop_batch(
+                        left_image, K_left, box_l, scale_l, cx_l, cy_l,
+                        fx_l, fy_l, self.dataset_id2cls, inst_cls,
+                        n_rots=self.n_rots)
+                _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
+                    build_rz_crop_batch(
+                        right_image, K_right, box_r, scale_r, cx_r, cy_r,
+                        fx_r, fy_r, self.dataset_id2cls, inst_cls,
+                        n_rots=self.n_rots)
+                T_right_ref = np.tile(
+                    np.eye(4, dtype=np.float32), (b_Rz.shape[0], 1, 1))
+                T_right_ref[:, :3, 3] = -np.einsum(
+                    'nij,j->ni', b_Rz,
+                    np.array([self.baseline, 0.0, 0.0], dtype=np.float32))
+                call = dict(
+                    obj_cls=b_obj_cls, roi_rgb=b_roi_rgb,
+                    bbox_loc=b_bbox_loc, roi_camK=b_roi_camK, fov=b_fov,
+                    Rz=b_Rz, roi_rgb_right=r_roi_rgb,
+                    bbox_loc_right=r_bbox_loc, roi_camK_right=r_roi_camK,
+                    fov_right=r_fov, T_right_ref=T_right_ref)
+                scene_id = int(ds._f_scene_id[fi]) * 2
+            else:
+                x_off = ds.EYE_W if eye == 'right' else 0
+                view_image = right_image if eye == 'right' else left_image
+                view_K = K_right if eye == 'right' else K_left
+                fx, fy = view_K[0, 0], view_K[1, 1]
+                box, scale, cx, cy = eye_box(eye, x_off)
+                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
+                    build_rz_crop_batch(
+                        view_image, view_K, box, scale, cx, cy, fx, fy,
+                        self.dataset_id2cls, inst_cls, n_rots=self.n_rots)
+                call = dict(
+                    obj_cls=b_obj_cls, roi_rgb=b_roi_rgb,
+                    bbox_loc=b_bbox_loc, roi_camK=b_roi_camK, fov=b_fov,
+                    Rz=b_Rz)
+                scene_id = int(ds._f_scene_id[fi]) * 2 + self.eye_index[eye]
+            payloads.append({'inst_name': inst_name, 'scene_id': scene_id,
+                             'im_id': im_id, 'call': call})
+        return payloads, {}
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='stereobj-1m')
@@ -212,6 +356,10 @@ if __name__ == '__main__':
                              'classification confidence is miscalibrated)')
     parser.add_argument('--max_instances', type=int, default=0,
                         help='debug cap on the number of instances (0 = all)')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader workers prefetching the CPU prep '
+                             '(decode + Rz crop building) to overlap the GPU '
+                             'call (0 = serial: prep on the main process)')
     parser.add_argument('--dataset_root', type=str, default=None,
                         help='override config.DATASET_ROOT (default: env '
                              'MRC_DATASET_ROOT / DATASET_ROOT, else config)')
@@ -293,7 +441,6 @@ if __name__ == '__main__':
     # Group instances by frame; one webp/json load per frame serves all of
     # them.  stereo: one row per both-eye instance (left frame).  mono: one row
     # per annotated (instance, eye); scene_id encodes the eye.
-    eye_index = {'left': 0, 'right': 1}
     frame_rows = {}
     for row in range(len(dataset._i_frame)):
         sides = int(dataset._i_sides[row])
@@ -311,118 +458,33 @@ if __name__ == '__main__':
         p['dataset'], 'stereo' if stereo else 'mono', n_inst, len(frame_rows)))
     print(est_pose_file)
 
-    import cv2
-    import json
-    import tarfile
-
-    baseline = dataset.baseline
+    n_rots = 1 if args.single_crop else 4
     stop_thresh = (args.refine_stop_thresh
                    if args.n_refine_iters > 1 else 0.0)
+    preparer = StereobjFramePreparer(dataset, stereo, n_rots, dataset_id2cls)
+    jobs = sorted(frame_rows.items())
     pose_results = []
-    for fi, items in tqdm(sorted(frame_rows.items()),
-                          desc='images', unit='img'):
-        shard = dataset._shard_paths[int(dataset._f_shard[fi])]
-        with tarfile.open(shard, 'r') as tar:
-            webp_buf = dataset._read_member(
-                tar, int(dataset._f_webp_offset[fi]),
-                int(dataset._f_webp_size[fi]))
-            label = json.loads(dataset._read_member(
-                tar, int(dataset._f_json_offset[fi]),
-                int(dataset._f_json_size[fi])).decode('utf-8'))
-        img_pair = cv2.imdecode(
-            np.frombuffer(webp_buf, np.uint8), cv2.IMREAD_COLOR)
-        left_image = torch.as_tensor(
-            np.ascontiguousarray(img_pair[:, :dataset.EYE_W]),
-            dtype=torch.float32)
-        right_image = torch.as_tensor(
-            np.ascontiguousarray(
-                img_pair[:, dataset.EYE_W:2 * dataset.EYE_W]),
-            dtype=torch.float32)
-        img_H, img_W = left_image.shape[:2]
-        K_left = dataset.eye_intrinsics('left')
-        K_right = dataset.eye_intrinsics('right')
-        fx_l, fy_l = K_left[0, 0], K_left[1, 1]
-        fx_r, fy_r = K_right[0, 0], K_right[1, 1]
-
-        inst_time = []
+    for payloads, _stats in tqdm(prep_jobs(jobs, preparer, args.num_workers),
+                                 total=len(jobs), desc='images', unit='img'):
         frame_objs = []
-        for row, eye in items:
-            obj_key = 'Object {}'.format(int(dataset._i_mask[row]) - 1)
-            inst_cls = torch.as_tensor(
-                int(dataset._i_cls[row]), dtype=torch.int64)
-            inst_name = dataset.cls_names[int(dataset._i_cls[row])]
-
-            def eye_box(view_eye, x_off):
-                bb = label['scaled_bboxes'][view_eye][obj_key]
-                x1 = bb['x_min'] - x_off
-                x2 = bb['x_max'] - x_off
-                y1, y2 = bb['y_min'], bb['y_max']
-                cx = min((x1 + x2) / 2.0, img_W)
-                cy = min((y1 + y2) / 2.0, img_H)
-                bw = int(max(0, min(x2 - x1, img_W)))
-                bh = int(max(0, min(y2 - y1, img_H)))
-                return (x1, y1, x2, y2), max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE, \
-                    cx, cy
-
+        inst_time = []
+        for payload in payloads:
             inst_timer = time.time()
-            if stereo:
-                box_l, scale_l, cx_l, cy_l = eye_box('left', 0)
-                box_r, scale_r, cx_r, cy_r = eye_box('right', dataset.EYE_W)
-                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
-                    build_rz_crop_batch(
-                        left_image, K_left, box_l, scale_l, cx_l, cy_l,
-                        fx_l, fy_l, dataset_id2cls, inst_cls,
-                        n_rots=1 if args.single_crop else 4)
-                _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
-                    build_rz_crop_batch(
-                        right_image, K_right, box_r, scale_r, cx_r, cy_r,
-                        fx_r, fy_r, dataset_id2cls, inst_cls,
-                        n_rots=1 if args.single_crop else 4)
-                T_right_ref = np.tile(
-                    np.eye(4, dtype=np.float32),
-                    (b_Rz.shape[0], 1, 1))
-                T_right_ref[:, :3, 3] = -np.einsum(
-                    'nij,j->ni', b_Rz,
-                    np.array([baseline, 0.0, 0.0], dtype=np.float32))
-                (est_R, est_t), _run_time = timed(lambda: inference_func(
-                    net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
-                    b_roi_camK, b_fov, b_Rz,
-                    n_refine_iters=args.n_refine_iters,
-                    refine_stop_thresh=stop_thresh,
-                    roi_rgb_right=r_roi_rgb, bbox_loc_right=r_bbox_loc,
-                    roi_camK_right=r_roi_camK, fov_right=r_fov,
-                    T_right_ref=T_right_ref, init_pose_noise=init_pose_noise))
-                scene_id = int(dataset._f_scene_id[fi]) * 2
-            else:
-                x_off = dataset.EYE_W if eye == 'right' else 0
-                view_image = right_image if eye == 'right' else left_image
-                view_K = K_right if eye == 'right' else K_left
-                fx, fy = view_K[0, 0], view_K[1, 1]
-                box, scale, cx, cy = eye_box(eye, x_off)
-                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
-                    build_rz_crop_batch(
-                        view_image, view_K, box, scale, cx, cy, fx, fy,
-                        dataset_id2cls, inst_cls,
-                        n_rots=1 if args.single_crop else 4)
-                (est_R, est_t), _run_time = timed(lambda: inference_func(
-                    net, device, b_obj_cls, b_roi_rgb, b_bbox_loc,
-                    b_roi_camK, b_fov, b_Rz,
-                    n_refine_iters=args.n_refine_iters,
-                    refine_stop_thresh=stop_thresh,
-                    init_pose_noise=init_pose_noise))
-                scene_id = int(dataset._f_scene_id[fi]) * 2 + eye_index[eye]
+            (est_R, est_t), _run_time = timed(lambda: inference_func(
+                net, device, init_pose_noise=init_pose_noise,
+                n_refine_iters=args.n_refine_iters,
+                refine_stop_thresh=stop_thresh, **payload['call']))
             inst_time.append(time.time() - inst_timer)
-            frame_objs.append((inst_name, est_R, est_t, scene_id))
-
-        view_cost = np.sum(inst_time) if inst_time else 0.0
-        for inst_name, est_R, est_t, scene_id in frame_objs:
+            frame_objs.append((payload, est_R, est_t))
+        view_cost = float(np.sum(inst_time)) if inst_time else 0.0
+        for payload, est_R, est_t in frame_objs:
             pose_results.append({
                 'time': view_cost,
                 # scene_id encodes the frame (and eye in mono); poses are
                 # expressed in the eye's camera frame.
-                'scene_id': scene_id,
-                'im_id': int(dataset._f_image_id[fi]),
-                'obj_id': dataset_id2cls[inst_name] + 1,
+                'scene_id': payload['scene_id'],
+                'im_id': payload['im_id'],
+                'obj_id': dataset_id2cls[payload['inst_name']] + 1,
                 'score': 1.0,
                 'R': est_R,
                 't': est_t,

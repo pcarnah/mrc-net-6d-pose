@@ -72,12 +72,15 @@ def freeze_except_stereo(model):
 def worker_init_fn(*_):
     # each worker should only use one os thread
     # numpy/cv2/torch take advantage of multithreading by default; left
-    # unchecked, N workers x all-cores oversubscribes the box and makes
-    # the CPU-bound lazy quaternion labels slower than single-threaded.
+    # unchecked, N workers x all-cores oversubscribes the box and makes the
+    # CPU-bound lazy quaternion labels slower than single-threaded.
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
     cv2.setNumThreads(0)
     torch.set_num_threads(1)
+    # forked workers inherit open tar file descriptions (shared offsets);
+    # drop them so each worker opens its own handles
+    stereobj_dataset._clear_tar_cache()
 
     # random seed
     np.random.seed(bop_cfg.RANDOM_SEED)

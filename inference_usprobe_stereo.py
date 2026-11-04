@@ -35,7 +35,7 @@ from lib import file_io
 
 from inference_bop import resolve_view_image_path
 from inference_stereobj import (timed, make_warmup_batch, build_rz_crop_batch,
-                                inference_func)
+                                inference_func, prep_jobs)
 from usprobe_dataset import (_pair_is_consistent, _orthonormalize,
                              pair_scenes)
 
@@ -74,6 +74,112 @@ def build_right_ref(b_Rz, R_l, t_l, R_r, t_r):
         T[i, :3, :3] = Rz @ R_rel @ Rz.T
         T[i, :3, 3] = Rz @ (t_r - R_rel @ t_l)
     return T
+
+
+class UsprobeScenePreparer:
+    """Picklable per-scene prep for one ``(left_scene, right_scene)`` job.
+
+    Loads the scene jsons, decodes every matched image, pairs annotations
+    (mirroring ``UsprobeDataset``) and builds the 4-way Rz crop batches.
+    Returns one payload per evaluated instance (the ``inference_func``
+    keyword arguments plus CSV metadata) and the skip count. Picklable so
+    DataLoader workers can run it ahead of the GPU call.
+    """
+
+    def __init__(self, split_dir, dataset_id2cls, n_rots):
+        self.split_dir = split_dir
+        self.dataset_id2cls = dataset_id2cls
+        self.n_rots = n_rots
+
+    def __call__(self, job):
+        left_scene, right_scene = job
+        left_dir = os.path.join(self.split_dir, left_scene)
+        right_dir = os.path.join(self.split_dir, right_scene)
+        if not os.path.isdir(right_dir):
+            return [], {'skipped': 0}
+        left_gt = file_io.load(os.path.join(left_dir, 'scene_gt.json'))
+        right_gt = file_io.load(os.path.join(right_dir, 'scene_gt.json'))
+        left_info = file_io.load(os.path.join(left_dir, 'scene_gt_info.json'))
+        right_info = file_io.load(
+            os.path.join(right_dir, 'scene_gt_info.json'))
+        left_cam = file_io.load(os.path.join(left_dir, 'scene_camera.json'))
+        right_cam = file_io.load(os.path.join(right_dir, 'scene_camera.json'))
+        scene_id = int(left_scene)
+
+        payloads = []
+        n_skipped = 0
+        for img_id_str in sorted(set(left_gt) & set(right_gt), key=int):
+            img_id = int(img_id_str)
+            left_image = torch.as_tensor(file_io.imread(
+                resolve_view_image_path(left_dir, img_id), 'color', 'BGR'),
+                dtype=torch.float32)
+            right_image = torch.as_tensor(file_io.imread(
+                resolve_view_image_path(right_dir, img_id), 'color', 'BGR'),
+                dtype=torch.float32)
+            img_H, img_W = left_image.shape[:2]
+            K_l = np.asarray(left_cam[img_id_str]['cam_K'],
+                             dtype=np.float32).reshape(3, 3)
+            K_r = np.asarray(right_cam[img_id_str]['cam_K'],
+                             dtype=np.float32).reshape(3, 3)
+            fx_l, fy_l = K_l[0, 0], K_l[1, 1]
+            fx_r, fy_r = K_r[0, 0], K_r[1, 1]
+
+            used_right = set()
+            for left_anno, left_bbox in zip(
+                    left_gt[img_id_str], left_info[img_id_str]):
+                obj_id = int(left_anno['obj_id'])
+                if obj_id not in self.dataset_id2cls:
+                    continue
+                r_idx = None
+                for cand, r_anno in enumerate(right_gt[img_id_str]):
+                    if cand in used_right:
+                        continue
+                    if int(r_anno['obj_id']) == obj_id:
+                        r_idx = cand
+                        break
+                if r_idx is None:
+                    n_skipped += 1
+                    continue
+                used_right.add(r_idx)
+
+                R_l = np.asarray(left_anno['cam_R_m2c'],
+                                 dtype=np.float32).reshape(3, 3)
+                t_l = np.asarray(left_anno['cam_t_m2c'], dtype=np.float32)
+                r_anno = right_gt[img_id_str][r_idx]
+                R_r = np.asarray(r_anno['cam_R_m2c'],
+                                 dtype=np.float32).reshape(3, 3)
+                t_r = np.asarray(r_anno['cam_t_m2c'], dtype=np.float32)
+                if not _pair_is_consistent(R_l, t_l, R_r, t_r):
+                    n_skipped += 1
+                    continue
+
+                box_l = bbox_to_xyxy(left_bbox['bbox_visib'])
+                box_r = bbox_to_xyxy(
+                    right_info[img_id_str][r_idx]['bbox_visib'])
+                scale_l, cx_l, cy_l = box_params(box_l, img_W, img_H)
+                scale_r, cx_r, cy_r = box_params(box_r, img_W, img_H)
+                inst_cls = self.dataset_id2cls[obj_id]
+
+                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
+                    build_rz_crop_batch(
+                        left_image, K_l, box_l, scale_l, cx_l, cy_l, fx_l,
+                        fy_l, self.dataset_id2cls, inst_cls,
+                        n_rots=self.n_rots)
+                _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
+                    build_rz_crop_batch(
+                        right_image, K_r, box_r, scale_r, cx_r, cy_r, fx_r,
+                        fy_r, self.dataset_id2cls, inst_cls,
+                        n_rots=self.n_rots)
+                T_right_ref = build_right_ref(b_Rz, R_l, t_l, R_r, t_r)
+                payloads.append({
+                    'scene_id': scene_id, 'im_id': img_id, 'obj_id': obj_id,
+                    'call': dict(
+                        obj_cls=b_obj_cls, roi_rgb=b_roi_rgb,
+                        bbox_loc=b_bbox_loc, roi_camK=b_roi_camK, fov=b_fov,
+                        Rz=b_Rz, roi_rgb_right=r_roi_rgb,
+                        bbox_loc_right=r_bbox_loc, roi_camK_right=r_roi_camK,
+                        fov_right=r_fov, T_right_ref=T_right_ref)})
+        return payloads, {'skipped': n_skipped}
 
 
 def load_model(args, device):
@@ -123,7 +229,12 @@ def main():
                         help='use only the rot_index=0 crop instead of the '
                              'argmax over the 4 Rz crops')
     parser.add_argument('--max_instances', type=int, default=0,
-                        help='debug cap on the number of instances (0 = all)')
+                        help='debug cap on the number of instances (0 = all; '
+                             'checked per scene when prefetching)')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader workers prefetching the CPU prep '
+                             '(image decode + crop building) to overlap the '
+                             'GPU call (0 = serial: prep on the main process)')
     parser.add_argument('--dataset_root', type=str, default=None)
     parser.add_argument('--eval_root', type=str, default=None)
     args = parser.parse_args()
@@ -169,102 +280,24 @@ def main():
     n_inst = 0
     n_skipped = 0
 
-    for left_scene, right_scene in tqdm(pairs, desc='scenes', unit='scene'):
-        left_dir = os.path.join(split_dir, left_scene)
-        right_dir = os.path.join(split_dir, right_scene)
-        if not os.path.isdir(right_dir):
-            continue
-        left_gt = file_io.load(os.path.join(left_dir, 'scene_gt.json'))
-        right_gt = file_io.load(os.path.join(right_dir, 'scene_gt.json'))
-        left_info = file_io.load(os.path.join(left_dir, 'scene_gt_info.json'))
-        right_info = file_io.load(
-            os.path.join(right_dir, 'scene_gt_info.json'))
-        left_cam = file_io.load(os.path.join(left_dir, 'scene_camera.json'))
-        right_cam = file_io.load(os.path.join(right_dir, 'scene_camera.json'))
-        scene_id = int(left_scene)
-
-        for img_id_str in sorted(set(left_gt) & set(right_gt), key=int):
-            img_id = int(img_id_str)
-            left_image = torch.as_tensor(file_io.imread(
-                resolve_view_image_path(left_dir, img_id), 'color', 'BGR'),
-                dtype=torch.float32)
-            right_image = torch.as_tensor(file_io.imread(
-                resolve_view_image_path(right_dir, img_id), 'color', 'BGR'),
-                dtype=torch.float32)
-            img_H, img_W = left_image.shape[:2]
-            K_l = np.asarray(left_cam[img_id_str]['cam_K'],
-                             dtype=np.float32).reshape(3, 3)
-            K_r = np.asarray(right_cam[img_id_str]['cam_K'],
-                             dtype=np.float32).reshape(3, 3)
-            fx_l, fy_l = K_l[0, 0], K_l[1, 1]
-            fx_r, fy_r = K_r[0, 0], K_r[1, 1]
-
-            used_right = set()
-            for left_anno, left_bbox in zip(
-                    left_gt[img_id_str], left_info[img_id_str]):
-                obj_id = int(left_anno['obj_id'])
-                if obj_id not in dataset_id2cls:
-                    continue
-                r_idx = None
-                for cand, r_anno in enumerate(right_gt[img_id_str]):
-                    if cand in used_right:
-                        continue
-                    if int(r_anno['obj_id']) == obj_id:
-                        r_idx = cand
-                        break
-                if r_idx is None:
-                    n_skipped += 1
-                    continue
-                used_right.add(r_idx)
-
-                R_l = np.asarray(left_anno['cam_R_m2c'],
-                                 dtype=np.float32).reshape(3, 3)
-                t_l = np.asarray(left_anno['cam_t_m2c'], dtype=np.float32)
-                r_anno = right_gt[img_id_str][r_idx]
-                R_r = np.asarray(r_anno['cam_R_m2c'],
-                                 dtype=np.float32).reshape(3, 3)
-                t_r = np.asarray(r_anno['cam_t_m2c'], dtype=np.float32)
-                if not _pair_is_consistent(R_l, t_l, R_r, t_r):
-                    n_skipped += 1
-                    continue
-
-                box_l = bbox_to_xyxy(left_bbox['bbox_visib'])
-                box_r = bbox_to_xyxy(
-                    right_info[img_id_str][r_idx]['bbox_visib'])
-                scale_l, cx_l, cy_l = box_params(box_l, img_W, img_H)
-                scale_r, cx_r, cy_r = box_params(box_r, img_W, img_H)
-                inst_cls = dataset_id2cls[obj_id]
-
-                b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
-                    build_rz_crop_batch(
-                        left_image, K_l, box_l, scale_l, cx_l, cy_l, fx_l, fy_l,
-                        dataset_id2cls, inst_cls, n_rots=n_rots)
-                _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
-                    build_rz_crop_batch(
-                        right_image, K_r, box_r, scale_r, cx_r, cy_r, fx_r,
-                        fy_r, dataset_id2cls, inst_cls, n_rots=n_rots)
-                T_right_ref = build_right_ref(b_Rz, R_l, t_l, R_r, t_r)
-
-                (est_R, est_t), _ = timed(lambda: inference_func(
-                    net, device, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK,
-                    b_fov, b_Rz, n_refine_iters=args.n_refine_iters,
-                    refine_stop_thresh=stop_thresh, roi_rgb_right=r_roi_rgb,
-                    bbox_loc_right=r_bbox_loc, roi_camK_right=r_roi_camK,
-                    fov_right=r_fov, T_right_ref=T_right_ref))
-                pose_results.append({
-                    'time': 0.0,
-                    'scene_id': scene_id,
-                    'im_id': img_id,
-                    'obj_id': obj_id,
-                    'score': 1.0,
-                    'R': est_R,
-                    't': est_t,
-                })
-                n_inst += 1
-                if args.max_instances and n_inst >= args.max_instances:
-                    break
-            if args.max_instances and n_inst >= args.max_instances:
-                break
+    preparer = UsprobeScenePreparer(split_dir, dataset_id2cls, n_rots)
+    for payloads, stats in tqdm(prep_jobs(pairs, preparer, args.num_workers),
+                                total=len(pairs), desc='scenes', unit='scene'):
+        n_skipped += stats['skipped']
+        for payload in payloads:
+            (est_R, est_t), _ = timed(lambda: inference_func(
+                net, device, n_refine_iters=args.n_refine_iters,
+                refine_stop_thresh=stop_thresh, **payload['call']))
+            pose_results.append({
+                'time': 0.0,
+                'scene_id': payload['scene_id'],
+                'im_id': payload['im_id'],
+                'obj_id': payload['obj_id'],
+                'score': 1.0,
+                'R': est_R,
+                't': est_t,
+            })
+            n_inst += 1
         if args.max_instances and n_inst >= args.max_instances:
             break
 
