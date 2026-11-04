@@ -15,12 +15,12 @@
 # Training runs with bf16 autocast by default (BF16=1; ~1.2x faster, ~25 percent
 # less memory); set BF16=0 to fall back to fp32.
 #
-# The submitted matrix follows RUN_PLAN.md:
-#   mono_K1 / mono_K3          stereobj-1m mono sources (3 epochs, MONO_N_EPOCHS)
-#   fr_{reg,regclf,regcorr,full}_k{1,3}
-#                              frozen fusion-component matrix (1 epoch/arm,
-#                              --freeze_except_stereo, K-matched mono source)
-#   fm_left_k1 / fm_mean_k1    fusion-mode baselines (frozen, reg axis only)
+# The submitted matrix follows RUN_PLAN.md section 4 (unfrozen primary):
+#   mono_K1                    stereobj-1m mono source (3 epochs, MONO_N_EPOCHS)
+#   uf_left_k1 / uf_mean_k1    controls: no cross-view pathway / fixed averaging
+#   uf_full_k1                 reg residual + clf fusion + pool correlation
+#   (reg-only arm already run: chkpt_stereobj-1m_stereo_cross_K1_resid_reg_only_unfrozen)
+# K=3 follow-ups and the frozen attribution matrix are commented templates.
 # The usprobe corollary arm is winner-dependent and left as a template.
 # Override the mono source checkpoint paths via PRETRAINED_MONO_K1/K3.
 set -euo pipefail
@@ -64,52 +64,48 @@ submit() {
   fi
 }
 
-# Sources: stereobj-1m mono runs at matched K (the frozen arms init from their
-# first epoch checkpoint; adjust the file names to the actual saves).
+# Sources: the stereobj-1m mono-K1 run; every primary arm resumes from its
+# epoch_001 checkpoint (adjust the file name to the actual save).
 PRETRAINED_MONO_K1="${PRETRAINED_MONO_K1:-chkpt_stereobj-1m_mono_K1/epoch_001.pth}"
 PRETRAINED_MONO_K3="${PRETRAINED_MONO_K3:-chkpt_stereobj-1m_mono_K3/epoch_001.pth}"
-FREEZE_FLAGS="--freeze_except_stereo"
 
-# --- Mono sources (dependency for every frozen arm; 3 epochs per plan) ------
-# (N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K1 stereobj-1m mono "" 1 "")
-# (N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K3 stereobj-1m mono "" 3 "")
+# --- Mono source (dependency for every primary arm; 3 epochs per plan) ------
+(N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K1 stereobj-1m mono "" 1 "")
 
-# --- Frozen fusion-component matrix (stereobj-1m, 1 epoch per arm) ----------
-# reg-only / reg+clf / reg+corr / full, x K in {1,3}. All arms init from the
-# K-matched mono source and freeze everything outside the stereo fusion
-# blocks + regressor (--freeze_except_stereo). clf_fusion/fusion_corr default
-# to the dataset config (True); arms toggle them off explicitly.
-# K=1
-submit fr_reg_k1     stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
-  "" "" "$FREEZE_FLAGS --no-clf_fusion --no-fusion_corr"
-submit fr_regclf_k1  stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
-  "" "" "$FREEZE_FLAGS --no-fusion_corr"
-submit fr_regcorr_k1 stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
-  "" "" "$FREEZE_FLAGS --no-clf_fusion"
-submit fr_full_k1    stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
-  "" "" "$FREEZE_FLAGS"
-# K=3
-# submit fr_reg_k3     stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-#   "" "" "$FREEZE_FLAGS --no-clf_fusion --no-fusion_corr"
-# submit fr_regclf_k3  stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-#   "" "" "$FREEZE_FLAGS --no-fusion_corr"
-# submit fr_regcorr_k3 stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-#   "" "" "$FREEZE_FLAGS --no-clf_fusion"
-# submit fr_full_k3    stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-#   "" "" "$FREEZE_FLAGS"
+# --- Primary matrix (unfrozen, 1 epoch, K=1, resumed from mono ep1) ---------
+# See RUN_PLAN.md section 4. reg-only is already run
+# (chkpt_stereobj-1m_stereo_cross_K1_resid_reg_only_unfrozen).
+# left_only / mean: controls for the stereo-eval operating point and two-view
+# data effects (no cross-view regression pathway / fixed averaging).
+submit uf_left_k1 stereobj-1m stereo left_only 1 "$PRETRAINED_MONO_K1" \
+  "" "" "--no-clf_fusion --no-fusion_corr"
+submit uf_mean_k1 stereobj-1m stereo mean 1 "$PRETRAINED_MONO_K1" \
+  "" "" "--no-clf_fusion --no-fusion_corr"
+# full: reg residual + clf fusion + pool correlation (dataset defaults).
+submit uf_full_k1 stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1"
 
-# --- Fusion-mode baselines (frozen K=1; reg axis only) ----------------------
-# left_only = honest no-reg-fusion control; mean = fixed averaging. Both
-# bypass stereo_fuse entirely (only the regressor trains).
-submit fm_left_k1 stereobj-1m stereo left_only 1 "$PRETRAINED_MONO_K1" \
-  "" "" "$FREEZE_FLAGS --no-clf_fusion --no-fusion_corr"
-submit fm_mean_k1 stereobj-1m stereo mean      1 "$PRETRAINED_MONO_K1" \
-  "" "" "$FREEZE_FLAGS --no-clf_fusion --no-fusion_corr"
+# --- K=3 follow-ups (after the K=1 verdict) ---------------------------------
+#submit uf_left_k3  stereobj-1m stereo left_only  3 "$PRETRAINED_MONO_K3" \
+#  "" "" "--no-clf_fusion --no-fusion_corr"
+#submit uf_mean_k3  stereobj-1m stereo mean       3 "$PRETRAINED_MONO_K3" \
+#  "" "" "--no-clf_fusion --no-fusion_corr"
+#submit uf_full_k3  stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3"
+
+# --- Frozen matrix (demoted: optional cheap per-component attribution) ------
+# Caveat: frozen results conflate freezing with pathway count. See RUN_PLAN 4.
+#submit fr_reg_k1     stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+#  "" "" "--freeze_except_stereo --no-clf_fusion --no-fusion_corr"
+#submit fr_regclf_k1  stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+#  "" "" "--freeze_except_stereo --no-fusion_corr"
+#submit fr_regcorr_k1 stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+#  "" "" "--freeze_except_stereo --no-clf_fusion"
+#submit fr_full_k1    stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+#  "" "" "--freeze_except_stereo"
 
 # --- Usprobe corollary (winner-dependent; fill in before submitting) --------
-# Train the winning arm's config on usprobe from the usprobe mono source,
-# same frozen protocol; eval via inference_usprobe_stereo.py.
-#submit fr_<winner>_usprobe usprobe stereo cross_view <K> \
-#  "<usprobe mono checkpoint>" usprobe "$USPROBE_SRC" "$FREEZE_FLAGS"
+# Train the winning arm's config on usprobe from the usprobe mono source;
+# eval via inference_usprobe_stereo.py.
+#submit uf_<winner>_usprobe usprobe stereo cross_view <K> \
+#  "<usprobe mono checkpoint>" usprobe "$USPROBE_SRC"
 
 echo "Done. Track with: squeue -u \$USER"

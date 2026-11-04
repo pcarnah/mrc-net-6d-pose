@@ -94,115 +94,122 @@ smoke). Usprobe pairing: `tools/check_usprobe_stereo.py`.
 - These runs are the **usprobe** lineage. The ablation matrix below runs on
   **stereobj-1m** (its `DATASET_CONFIG` defaults: `stereo_mode='stereo'`,
   `fusion_residual`/`clf_fusion`/`fusion_corr` all True; annotated eval split
-  is `val` — webds test shards carry images only). stereobj-1m mono sources
-  are a dependency: train mono K=1/K=3 (`--stereo_mode mono`) at least past
-  the first save before the K-matched frozen arms can start.
+  is `val` — webds test shards carry images only). The stereobj-1m mono-K1
+  source is a dependency: all primary arms resume from its `epoch_001.pth`.
 
-## 4. Ablation plan (reg+clf+corr, K∈{1,3}, frozen — stereobj-1m)
+## 4. Ablation plan v2 (unfrozen primary + controls — stereobj-1m)
 
-**Principles.**
-1. Frozen matrix = primary ablation: identical trunk, only fusion+regressor
-   differ. Zero-init ⇒ every frozen run starts exactly at its mono source's
-   performance.
-2. Source checkpoint matched per K: K=1 arms ← stereobj-1m mono-K1 first
-   checkpoint; K=3 arms ← stereobj-1m mono-K3 first checkpoint (matched trunk
-   quality per K).
-3. The running full-finetune stereo-K1 is a separate reference; rank
-   frozen-vs-frozen, then full-finetune the winner.
-4. **stereobj-1m is the ablation dataset; usprobe is the corollary** — after
-   the winner is picked, train the winning config on usprobe (from the
-   usprobe mono checkpoints) and report usprobe test as the transfer result.
+**Revised after the first results round** (see §4b for what was measured and
+why the protocol changed):
 
-**Matrix (8 frozen runs, `--dataset stereobj-1m --stereo_mode stereo`).**
+1. **Unfrozen is the primary protocol.** The unfrozen reg-only run (1 epoch
+   from mono ep1) is the best row in the matched comparison; the frozen full
+   arm is still below its init at a partial epoch. A frozen mono-trained
+   trunk likely caps late fusion (no co-adaptation), and per unit of insight
+   unfrozen is currently cheaper (best-in-table in one epoch vs below-init at
+   a partial frozen epoch).
+2. **`left_only`/`mean` resumed from the same mono checkpoint are the
+   controls.** With an unfrozen trunk, "stereo beats mono" conflates (a) the
+   stereo-eval BN operating point, (b) two-view training data, (c) the fusion
+   pathway. `left_only` (no cross-view regression pathway) isolates (a)+(b);
+   `mean` (fixed averaging, no learned fusion params) adds a parameter-free
+   fusion baseline. Only the excess over these controls is attributable to
+   fusion. `right_only` stays skipped.
+3. **Frozen matrix demoted** to optional cheap secondary attribution — with
+   the caveat that frozen results conflate freezing with pathway count (the
+   completed frozen arm is full-fusion, the completed unfrozen arm reg-only).
+4. **stereobj-1m is the ablation dataset; usprobe is the corollary** — train
+   the winning config on usprobe from the usprobe mono checkpoint.
 
-| arm | `--clf_fusion` | `--fusion_corr` | K=1 | K=3 |
-|---|---|---|---|---|
-| reg-only | off | off | ✓ | ✓ |
-| reg+clf | on | off | ✓ | ✓ |
-| reg+corr | off | on | ✓ | ✓ |
-| full | on | on | ✓ | ✓ |
+**Primary matrix (unfrozen, 1 epoch, K=1, all resumed from mono-K1
+`epoch_001.pth`).**
 
-No corr-only arm (correlation needs a fusion conv to enter); clf-only is
-weak (no disparity cue), optional.
+| arm | fusion | clf/corr | status |
+|---|---|---|---|
+| reg-only (`resid_reg_only_unfrozen`) | cross_view residual | off | **done** — best row |
+| `left_only` control | none | off | to run |
+| `mean` baseline | fixed avg | off | to run |
+| full | cross_view residual | on | to run |
 
-**Common flags** (dev box, host-RAM bound — or the SLURM harness for full
-epochs):
+K=3 versions follow only for arms that matter after the K=1 verdict.
+
+**Common flags** (dev box, host-RAM bound — or the SLURM harness):
 
 ```
 python main.py --dataset stereobj-1m --stereo_mode stereo \
-    --pretrained <stereobj-mono-ep001.pth> --freeze_except_stereo \
+    --pretrained chkpt_stereobj-1m_mono_K1/epoch_001.pth \
     --batch_size 4 --num_workers 0 --warmup_step 100 \
     --save_every_steps 500 --save_every_epochs 1 --no_compile \
-    --chkpt_dir chk_stereobj_fr_<arm>_k<K> --log_dir logs_stereobj_fr_<arm>_k<K>
+    --chkpt_dir chkpt_stereobj-1m_uf_<arm>_k1 --log_dir logs_uf_<arm>_k1
 ```
 
-On the cluster (`scripts/slurm/submit_training.sh` → `train.sbatch`):
-stereobj-1m is ~24 h/epoch full-train; frozen arms cut backward cost but the
-forward (2× synthetic + right real branch, ×K iterations) still dominates —
-budget accordingly (`TIME`, `N_EPOCHS`, `SAVE_EVERY_STEPS=2000`,
-`SAVE_EVERY_EPOCHS=1` defaults; step checkpoints are the recovery point —
-`main.py` has no resume).
+Arm-specific: `left_only`/`mean` add `--fusion left_only|mean
+--no-clf_fusion --no-fusion_corr`; full uses dataset defaults (clf+corr on);
+reg-only (already run) used `--no-clf_fusion --no-fusion_corr`. No
+`--freeze_except_stereo` on primary arms.
 
-Arm-specific: reg-only adds `--no-clf_fusion --no-fusion_corr`; reg+clf adds
-`--no-fusion_corr`; reg+corr adds `--no-clf_fusion`; full uses defaults.
+On the cluster: stereobj-1m is ~24 h/epoch full-train — the primary matrix is
+4 single-epoch jobs (`TIME` per job; `SAVE_EVERY_STEPS` checkpoints are the
+recovery point — `main.py` has no resume).
 
-**Fusion-mode baselines (secondary axis, frozen K=1).** `--fusion` ablates
-*how* the views are combined (`cross_view`/`mean`/`left_only`/`right_only`),
-orthogonal to the clf/corr component axis above. Two cheap arms slot in
-right after the reg-only frozen anchor, with `--no-clf_fusion
---no-fusion_corr` so they compare cleanly on the reg axis:
-
-- `left_only` — the honest no-reg-fusion control (no cross-view regression
-  pathway at all; the matrix's reg-only arm is a zero-init *learned*
-  residual, which is not the same baseline).
-- `mean` — fixed `0.5·(left+right)` averaging, no learned fusion params;
-  tests whether the learned conv beats simple averaging.
-
-`right_only` (regressor on the right eye alone) is low-value; skip. Both
-arms bypass `stereo_fuse` entirely, so a frozen run trains only the
-regressor; the reg-side correlation is inert under non-cross_view modes;
-`left_only` still computes the right synthetic branch per iteration (known
-wasted compute, ablation-only).
-
-**Eval.** Per arm at its training K, on the stereobj-1m val split:
-
-```
-python inference_stereobj.py --dataset stereobj-1m \
-    --checkpoint_name chk_stereobj_fr_<arm>_k<K> --model_name <file> \
-    --output_suffix fr-<arm>_k<K> --n_refine_iters <K> --no_compile \
-    --num_workers 4
-```
-
-`--num_workers N` prefetches the CPU prep (decode + Rz crop building) in
-DataLoader workers so it overlaps the GPU call — the eval loop was
-data-throughput bound; payloads are bit-identical to the serial path
-(verified), differences beyond GPU run-to-run noise are not expected.
-
-Quick iteration: `scripts/eval_stereobj_subset.sh` (subset eval; `CROP=multi`
-re-enables the 4-crop argmax).
-
-Baselines: stereobj-1m mono source checkpoints (one per K); optional step-0
-sanity eval of any frozen run must reproduce mono numbers bit-for-bit
-(zero-init guarantee; `check_stereo.py` gates the wiring).
+**Eval discipline (matched comparison).**
+- Always compare on the **common-frame set**: mono CSVs carry ~2 rows/frame
+  (both eyes) vs stereo's 1, and 5000-instance caps land at different frames —
+  of 715/716 frames only 358 are common. Comparing full CSVs mixes frame
+  populations and produced the earlier false "stereo adds nothing" (the
+  tube_rack −0.200 was largely this artifact). Filter every CSV to the common
+  (scene_id, im_id) set before scoring; exclude centrifuge_tube; use the
+  4-crop (multi) eval.
+- Scored references: `reports/common_*_excl_ct.json` (add-s/proj, per-object).
+- **z-error is the metric to watch**: ~96% of translation error is depth
+  (z-share of euc ≈ 0.96–0.97 on matched frames), so add-s tracks |dz|
+  directly. Track |dz| mean/median/p90 **and signed bias** per arm.
+- **Step-0 stereo eval control** for every resumed run: the init checkpoint
+  evaluated in stereo mode separates the BN operating-point shift from
+  training effects (a mono-mode eval is not a bit-identical reference for a
+  stereo model). Still pending for the frozen arm.
+- Quick iteration: `scripts/eval_stereobj_subset.sh` (`CROP=multi`,
+  `NUM_WORKERS` default 2).
 
 **Priority order.**
-1. full K=1, full K=3 — "does clf+corr help at all" vs reg-only.
-2. reg+clf K=1, reg+corr K=1 — attribute the gain.
-3. reg-only frozen K=1 — the frozen anchor.
-4. `left_only` K=1, `mean` K=1 — fusion-mode baselines for the reg axis.
-5. Remaining K=3 arms.
-6. Winner → usprobe corollary: train the winning config on usprobe
-   (`--dataset usprobe --stereo_mode stereo --pretrained <usprobe-mono-ep>`,
-   same frozen protocol), eval usprobe test via `inference_usprobe_stereo.py`.
+1. `left_only` K=1 and `mean` K=1 (controls) + `full` K=1 — the three missing
+   primary arms vs the completed reg-only row.
+2. Step-0 stereo evals for resumed runs (cheap, interprets everything else).
+3. K=3 versions of the winning arm(s).
+4. Winner → usprobe corollary (`--dataset usprobe --stereo_mode stereo
+   --pretrained <usprobe-mono-ep>`), eval via `inference_usprobe_stereo.py`.
+5. Optional: frozen matrix for cheap per-component attribution.
 
-Decision rule: full ≫ reg-only → attribute, then full-finetune the winner
-for the headline number. full ≈ reg-only → keep reg only.
+Decision rule: full > reg-only > controls → clf/corr earn their keep;
+reg-only ≈ controls → the gain is data/operating-point, not fusion; any arm
+< its step-0 control → that pathway hurts at this training budget.
 
-**Budget (rough).** Dev box at batch 4: frozen stereo K=1 ~45–60 min/epoch
-(forward unchanged, backward collapses to fusion+regressor), K=3 ~2.5–3× K=1
-— but stereobj-1m shard counts dominate; on the cluster expect ~24 h/epoch
-full-train as the upper bound. One epoch per arm is likely enough signal; if
-extended, extend all arms identically.
+**Budget (rough).** Dev box at batch 4: unfrozen stereo K=1 ~1.5–2 h/epoch
+(forward + full backward), K=3 ~2.5–3× K=1; cluster ~24 h/epoch full-train is
+the upper bound. One epoch per arm; extend all arms identically if extended.
+
+## 4b. Results so far (matched common-frame comparison, centrifuge_tube
+excluded, multi crop, n=1790)
+
+| run | add-s mean | median | AUC | acc.1d | proj mean | \|dz\| mean | dz bias |
+|---|---|---|---|---|---|---|---|
+| mono ep0 (source) | 12.60 | 10.72 | 0.450 | 0.823 | **19.62** | 11.93 | +1.42 |
+| mono ep1 (init) | 12.54 | 9.36 | 0.483 | 0.844 | 31.29 | 12.13 | −2.69 |
+| stereo ep0 full-ft | 16.84 | 13.58 | 0.361 | 0.711 | 34.22 | 16.58 | −3.56 |
+| stereo ep1 full-ft | 12.65 | 9.65 | 0.478 | 0.846 | 19.01 | 12.21 | −4.39 |
+| stereo ep2 full-ft | 11.77 | 9.01 | 0.500 | 0.863 | 21.97 | 11.41 | −1.00 |
+| **stereo ep0 resid unfrozen** | **11.28** | **8.46** | **0.517** | **0.870** | 29.39 | **10.96** | **−0.28** |
+| stereo ep0 scratch | 26.64 | 19.56 | 0.227 | 0.548 | 46.18 | 25.24 | +0.61 |
+| chk_full frozen @120k | 13.24 | 10.20 | 0.454 | 0.791 | 26.98 | 12.84 | +2.80 |
+
+Findings: stereo ep2 beats mono ep1 on every add-s metric and |dz|; the
+1-epoch unfrozen reg-only run is best overall with near-zero depth bias;
+scratch fails (mono init is load-bearing); the frozen full arm is below init
+with a flipped depth bias (pending its step-0 control). tube_rack_50_ml's
+apparent −0.200 regression was mostly the frame-population artifact; the
+real residual is symmetry-branch churn (58/52 flips; the model selects the
+180° twin rotation with identity translation — the twin's off-center
+(101, −71, 0) mm mesh-frame offset makes that combination add-s-invalid).
 
 **Gotchas.**
 - **Eval batch composition changes results.** The backbone's BatchNorm is
