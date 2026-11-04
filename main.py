@@ -47,8 +47,10 @@ def match_weight_dict(d1, d2):
     return matched
 
 # Parameter prefixes kept trainable by --freeze_except_stereo: the stereo
-# fusion blocks (regression + classifier residual) and the regression head.
-TRAINABLE_PREFIXES = ('stereo_fuse.', 'stereo_fuse_clf.', 'regressor.')
+# fusion blocks (regression + classifier residual), their shared left/right
+# correlation probes, and the regression head.
+TRAINABLE_PREFIXES = ('stereo_fuse.', 'stereo_fuse_clf.', 'stereo_corr.',
+                      'regressor.')
 
 
 def freeze_except_stereo(model):
@@ -112,7 +114,8 @@ def main_worker(rank, world_size, args):
 
     model_config = bop_cfg.ModelConfig.from_dataset_config(
         args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion,
-        fusion_residual=args.fusion_residual, clf_fusion=args.clf_fusion)
+        fusion_residual=args.fusion_residual, clf_fusion=args.clf_fusion,
+        fusion_corr=args.fusion_corr)
 
     if args.is_parallel:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset)
@@ -131,12 +134,13 @@ def main_worker(rank, world_size, args):
             print('WARNING: --freeze_except_stereo on a mono model (no '
                   'stereo_fuse block); only regressor stays trainable.')
         n_train, n_frozen = freeze_except_stereo(model)
-        if hasattr(model, 'stereo_fuse_clf'):
-            assert all(p.requires_grad
-                       for p in model.stereo_fuse_clf.parameters()), \
-                'stereo_fuse_clf must stay trainable under ' \
-                '--freeze_except_stereo (it is zero-init and would never ' \
-                'learn if frozen)'
+        for block in ('stereo_fuse', 'stereo_fuse_clf', 'stereo_corr'):
+            if hasattr(model, block):
+                assert all(p.requires_grad
+                           for p in getattr(model, block).parameters()), \
+                    '{} must stay trainable under --freeze_except_stereo ' \
+                    '(the zero-init fusion would never learn if frozen)'.format(
+                        block)
         print('Froze {:,} params; training {:,} params '
               '(stereo fusion + regressor only).'.format(n_frozen, n_train))
     if not args.no_compile:
@@ -391,6 +395,15 @@ if __name__ == '__main__':
                              'gamma/beta feeding the unchanged '
                              'ClassificationHead, so the bootstrap sees '
                              'right-eye info. Default: the dataset config '
+                             'value (stereobj-1m/usprobe: True). Checkpoints '
+                             'record the flag in model_config.')
+    parser.add_argument('--fusion_corr',
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help='pool-level left/right patch correlation: a '
+                             '121-ch correlation volume (patch 11 over 64-dim '
+                             'projections) concatenated into the reg and clf '
+                             'fusion conv inputs, giving the fusion a '
+                             'disparity cue. Default: the dataset config '
                              'value (stereobj-1m/usprobe: True). Checkpoints '
                              'record the flag in model_config.')
     parser.add_argument('--seed', type=int, default=bop_cfg.RANDOM_SEED,

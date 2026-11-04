@@ -391,6 +391,12 @@ class MRCNet(nn.Module):
         self.stereo_fusion = bool(getattr(cfg, 'stereo_fusion', False))
         self.fusion_mode = getattr(cfg, 'fusion_mode', 'cross_view')
         self.fusion_residual = bool(getattr(cfg, 'fusion_residual', False))
+        # Pool-level left/right patch correlation (disparity cue): a 121-ch
+        # correlation volume (patch 11 over 64-dim projections) concatenated
+        # into both fusion conv inputs. Zero init of the fusion GN keeps the
+        # correlation inert at init; the fusion learns to read it.
+        self.fusion_corr = bool(getattr(cfg, 'fusion_corr', False))
+        corr_ch = 121 if self.fusion_corr else 0
         if self.stereo_fusion:
             # Always built for stereo models so state_dicts are interchangeable
             # across fusion variants (left_only/right_only/mean simply bypass
@@ -401,14 +407,22 @@ class MRCNet(nn.Module):
                 # tensor equals the left view exactly (the conv keeps its
                 # default init; gamma receives the first gradient).
                 self.stereo_fuse = nn.Sequential(
-                    nn.Conv2d(4096, 2048, kernel_size=3, padding=1,
+                    nn.Conv2d(4096 + corr_ch, 2048, kernel_size=3, padding=1,
                               bias=False),
                     nn.GroupNorm(32, 2048))
                 nn.init.zeros_(self.stereo_fuse[1].weight)
                 nn.init.zeros_(self.stereo_fuse[1].bias)
             else:
                 self.stereo_fuse = ConvGnReLU(
-                    4096, 2048, kernel_size=3, padding=1)
+                    4096 + corr_ch, 2048, kernel_size=3, padding=1)
+            if self.fusion_corr:
+                # Fresh instances (the decoder's Correlation modules are
+                # trained for synt-vs-real matching); one per pool width.
+                self.stereo_corr = nn.ModuleDict({
+                    'reg': Correlation(patch_size=11, input_dim=2048,
+                                       feature_dim=64),
+                    'clf': Correlation(patch_size=11, input_dim=1024,
+                                       feature_dim=64)})
 
         # Residual classifier fusion: clf_pool = left + zero-init
         # GN(conv(cat(left, right))) feeding the unchanged ClassificationHead,
@@ -419,7 +433,8 @@ class MRCNet(nn.Module):
         self.clf_fusion = bool(getattr(cfg, 'clf_fusion', False))
         if self.stereo_fusion and self.clf_fusion:
             self.stereo_fuse_clf = nn.Sequential(
-                nn.Conv2d(2048, 1024, kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(2048 + corr_ch, 1024, kernel_size=3, padding=1,
+                          bias=False),
                 nn.GroupNorm(32, 1024))
             nn.init.zeros_(self.stereo_fuse_clf[1].weight)
             nn.init.zeros_(self.stereo_fuse_clf[1].bias)
@@ -545,17 +560,18 @@ class MRCNet(nn.Module):
                 x_reg = {'reg_pool': reg_pool, 'fov': fov_left}
                 pose_res, depth_res, trans_res = self.regressor(x_reg)
             else:  # cross_view (default)
+                cat = [x_reg_left['reg_pool'], x_reg_right['reg_pool']]
+                if self.fusion_corr:
+                    cat.append(self.stereo_corr['reg'](
+                        x_reg_left['reg_pool'], x_reg_right['reg_pool']))
+                cat = torch.cat(cat, dim=1)
                 if self.fusion_residual:
                     # Residual fusion: left + zero-init conv(cat(left, right)).
                     # Zero init keeps the fused tensor equal to the left view
                     # at init; the conv learns the cross-view correction.
-                    reg_pool = x_reg_left['reg_pool'] + self.stereo_fuse(
-                        torch.cat([x_reg_left['reg_pool'],
-                                   x_reg_right['reg_pool']], dim=1))
+                    reg_pool = x_reg_left['reg_pool'] + self.stereo_fuse(cat)
                 else:
-                    reg_pool = self.stereo_fuse(torch.cat(
-                        [x_reg_left['reg_pool'],
-                         x_reg_right['reg_pool']], dim=1))
+                    reg_pool = self.stereo_fuse(cat)
                 x_reg = {'reg_pool': reg_pool, 'fov': fov_left}
                 pose_res, depth_res, trans_res = self.regressor(x_reg)
 
@@ -702,8 +718,12 @@ class MRCNet(nn.Module):
             x_clf_right = self.decoder(x_real_in_r)
             x_clf_right['fov'] = aux['fov_right']
             if self.clf_fusion:
-                clf_pool = x_clf['clf_pool'] + self.stereo_fuse_clf(torch.cat(
-                    [x_clf['clf_pool'], x_clf_right['clf_pool']], dim=1))
+                cat = [x_clf['clf_pool'], x_clf_right['clf_pool']]
+                if self.fusion_corr:
+                    cat.append(self.stereo_corr['clf'](
+                        x_clf['clf_pool'], x_clf_right['clf_pool']))
+                clf_pool = x_clf['clf_pool'] + self.stereo_fuse_clf(
+                    torch.cat(cat, dim=1))
                 x_clf = dict(x_clf, clf_pool=clf_pool)
 
         pose_logits, depth_logits, trans_logits = self.classifier(x_clf)

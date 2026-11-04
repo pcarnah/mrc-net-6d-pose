@@ -12,9 +12,11 @@ Mono behaviour is gated separately by ``tools/regression_guard.py`` and
      concat order, left-fov regressor.)
   2. Random-init fusion: every prediction/loss finite at K=1..3 with the
      expected per-iteration loss keys present.
-3. **clf fusion:** the ``clf_pool`` residual fusion must be a zero-init
-      identity vs ``clf_fusion=False`` and receive gradient from the
-      iteration-0 classification losses (GN gamma first).
+3. **clf/corr fusion:** the ``clf_pool`` residual fusion and the pool-level
+      left/right correlation must both be zero-init identities vs a
+      fusion-free model, and the classification losses must reach the clf
+      fusion GN gamma (the correlation enters through the same zero-init
+      convs, so its grads are gamma-scaled at init).
   4. Training-mode backward: finite gradients reach ``stereo_fuse`` and the
       shared backbone/regressor.
   5. Informational only: render geometrically consistent stereo observations at
@@ -63,12 +65,16 @@ class ZeroResidual(torch.nn.Module):
         return torch.zeros_like(x[:, :REG_CHANNELS])
 
 
-def build_stereo_model(device, load_mono=True, clf_fusion=None):
+def build_stereo_model(device, load_mono=True, clf_fusion=None,
+                       fusion_corr=None):
     model_config = dataclasses.replace(
         cfg.ModelConfig.from_dataset_config(guard.DATASET),
         stereo_fusion=True, fusion_residual=True)
     if clf_fusion is not None:
         model_config = dataclasses.replace(model_config, clf_fusion=clf_fusion)
+    if fusion_corr is not None:
+        model_config = dataclasses.replace(
+            model_config, fusion_corr=fusion_corr)
     model = models.MRCNet(model_config).to(device)
     if load_mono:
         checkpoint = torch.load(
@@ -187,30 +193,39 @@ def check_random_fusion(device):
 
 
 def check_clf_fusion(device):
-    """clf_pool residual fusion: zero-init identity + gradient reach.
+    """clf/corr fusion: zero-init identity + gradient reach.
 
-    At init the zeroed GN makes the fused ``clf_pool`` equal the left view
-    exactly, so a clf_fusion model must reproduce a clf_fusion=False model
-    bit-for-bit; the iteration-0 classification losses must then reach the
-    fusion (the GN gamma receives the first gradient, like the reg fusion).
+    At init the zeroed GNs make the fused ``clf_pool``/``reg_pool`` equal the
+    left view exactly, so a clf+corr-fusion model must reproduce a
+    fusion-free model bit-for-bit; the iteration-0 classification losses must
+    then reach the clf fusion (the GN gamma receives the first gradient, like
+    the reg fusion).
     """
     failures = []
     inputs, aux = build_stereo_aux(device)
 
-    base = build_stereo_model(device, clf_fusion=False)
+    base = build_stereo_model(device, clf_fusion=False, fusion_corr=False)
     base_preds = run_forward(base, inputs, aux)
     base_preds = {k: v.detach().cpu().float() for k, v in base_preds.items()}
     del base
     torch.cuda.empty_cache()
 
-    model = build_stereo_model(device, clf_fusion=True)
+    model = build_stereo_model(device, clf_fusion=True, fusion_corr=True)
     if not hasattr(model, 'stereo_fuse_clf'):
         failures.append('clf_fusion model has no stereo_fuse_clf')
+        return failures
+    if not hasattr(model, 'stereo_corr'):
+        failures.append('fusion_corr model has no stereo_corr')
         return failures
     gn = model.stereo_fuse_clf[1]
     if float(gn.weight.detach().abs().max()) != 0.0 \
             or float(gn.bias.detach().abs().max()) != 0.0:
         failures.append('stereo_fuse_clf GN not zero-initialised')
+    for key in ('reg', 'clf'):
+        corr_gn = model.stereo_corr[key]
+        if float(corr_gn.proj_in.weight.detach().abs().max()) == 0.0:
+            failures.append('stereo_corr[{}] proj_in unexpectedly zero'.format(
+                key))
 
     preds = run_forward(model, inputs, aux)
     identity_ok = True
@@ -219,9 +234,9 @@ def check_clf_fusion(device):
         b = preds[key].detach().cpu().float()
         if not torch.allclose(a, b, rtol=1e-4, atol=1e-5):
             identity_ok = False
-            failures.append('clf zero-init identity {} diff={:.3e}'.format(
+            failures.append('clf/corr zero-init identity {} diff={:.3e}'.format(
                 key, float((a - b).abs().max())))
-    print('clf zero-init identity vs clf_fusion=False: {}'.format(
+    print('clf+corr zero-init identity vs fusion-free: {}'.format(
         'OK' if identity_ok else 'FAIL'))
 
     torch.use_deterministic_algorithms(False)
@@ -240,8 +255,15 @@ def check_clf_fusion(device):
         elif float(gn_grad.float().abs().max()) == 0.0:
             failures.append('stereo_fuse_clf GN gamma grad is zero')
         else:
-            print('clf backward: loss={:.4f} GN gamma |grad|max={:.3e}'.format(
-                float(loss.detach()), float(gn_grad.float().abs().max())))
+            corr_ok = all(
+                p.grad is not None and torch.isfinite(p.grad.float()).all()
+                for p in model.stereo_corr.parameters())
+            if not corr_ok:
+                failures.append('stereo_corr grads missing/non-finite')
+            print('clf backward: loss={:.4f} GN gamma |grad|max={:.3e} '
+                  'stereo_corr grads finite={}'.format(
+                      float(loss.detach()), float(gn_grad.float().abs().max()),
+                      corr_ok))
     model.zero_grad(set_to_none=True)
     model.eval()
     return failures

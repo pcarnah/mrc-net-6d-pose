@@ -252,6 +252,11 @@ DATASET_CONFIG = {
         'stereo_fusion': True,
         # Fusion operation; overridable per run via --fusion (see FUSION_MODES).
         'fusion_mode': 'cross_view',
+        # Pool-level left/right patch correlation concatenated into both
+        # fusion conv inputs (reg + clf) for new training runs; old
+        # checkpoints carry fusion_corr=False in their model_config and
+        # rebuild without it.
+        'fusion_corr': True,
         # Residual classifier fusion (clf_pool = left + zero-init
         # GN(conv(cat(left, right)))) for new training runs; old checkpoints
         # carry clf_fusion=False in their model_config and rebuild without it.
@@ -283,6 +288,9 @@ DATASET_CONFIG = {
         'stereo_fusion': False,
         'fusion_mode': 'cross_view',
         'fusion_residual': True,
+        # Pool-level left/right patch correlation for stereo runs (inert
+        # while stereo_fusion is False); overridable via --fusion_corr.
+        'fusion_corr': True,
         # Residual classifier fusion for stereo runs (inert while
         # stereo_fusion is False); overridable per run via --clf_fusion.
         'clf_fusion': True,
@@ -356,10 +364,18 @@ class ModelConfig:
     # Only built when stereo_fusion is also True. Defaults to False so old
     # checkpoint model_config dicts rebuild identical state_dicts.
     clf_fusion: bool = False
+    # Pool-level left/right patch correlation: a 121-ch correlation volume
+    # (patch 11 over 64-dim projections of both eyes' pool features)
+    # concatenated into the reg and clf fusion conv inputs, giving the fusion
+    # a disparity/depth cue a 3x3 conv cannot reach. Only built when
+    # stereo_fusion is also True. Defaults to False so old checkpoint
+    # model_config dicts rebuild identical state_dicts.
+    fusion_corr: bool = False
 
     @classmethod
     def from_dataset_config(cls, dataset, stereo_mode=None, fusion=None,
-                            fusion_residual=None, clf_fusion=None):
+                            fusion_residual=None, clf_fusion=None,
+                            fusion_corr=None):
         dataset_cfg = DATASET_CONFIG[dataset]
         stereo = dataset_cfg.get('stereo_fusion', False)
         if stereo_mode is not None:
@@ -373,6 +389,9 @@ class ModelConfig:
         clf = dataset_cfg.get('clf_fusion', False)
         if clf_fusion is not None:
             clf = clf_fusion
+        corr = dataset_cfg.get('fusion_corr', False)
+        if fusion_corr is not None:
+            corr = fusion_corr
         return cls(
             dataset=dataset,
             n_decoders=dataset_cfg['num_class'],
@@ -382,7 +401,8 @@ class ModelConfig:
             stereo_fusion=stereo,
             fusion_mode=fusion_mode,
             fusion_residual=residual,
-            clf_fusion=clf)
+            clf_fusion=clf,
+            fusion_corr=corr)
 
 
 def set_runtime_overrides(dataset, stereo_mode=None, fusion=None):
