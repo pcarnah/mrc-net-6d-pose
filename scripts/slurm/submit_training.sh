@@ -84,6 +84,13 @@ submit uf_mean_k1 stereobj-1m stereo mean 1 "$PRETRAINED_MONO_K1" \
 # full: reg residual + clf fusion + pool correlation (dataset defaults).
 submit uf_full_k1 stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1"
 
+submit uf_reg_k1     stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+ "" "" "--no-clf_fusion --no-fusion_corr"
+submit uf_regclf_k1  stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+ "" "" "--no-fusion_corr"
+submit uf_regcorr_k1 stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
+ "" "" "--no-clf_fusion"
+
 # --- K=3 follow-ups (after the K=1 verdict) ---------------------------------
 #submit uf_left_k3  stereobj-1m stereo left_only  3 "$PRETRAINED_MONO_K3" \
 #  "" "" "--no-clf_fusion --no-fusion_corr"

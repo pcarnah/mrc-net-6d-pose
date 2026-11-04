@@ -124,14 +124,19 @@ why the protocol changed):
 **Primary matrix (unfrozen, 1 epoch, K=1, all resumed from mono-K1
 `epoch_001.pth`).**
 
-| arm | fusion | clf/corr | status |
-|---|---|---|---|
-| reg-only (`resid_reg_only_unfrozen`) | cross_view residual | off | **done** — best row |
-| `left_only` control | none | off | to run |
-| `mean` baseline | fixed avg | off | to run |
-| full | cross_view residual | on | to run |
+| arm | fusion | clf | corr | status |
+|---|---|---|---|---|
+| `left_only` control | none | off | off | to run |
+| `mean` control | fixed avg | off | off | to run |
+| `uf_reg_k1` | cross_view residual | off | off | to run (a prior 1-epoch reg-only run exists: `chkpt_stereobj-1m_stereo_cross_K1_resid_reg_only_unfrozen` — keep as a reference point) |
+| `uf_regclf_k1` | cross_view residual | on | off | to run |
+| `uf_regcorr_k1` | cross_view residual | off | on | to run |
+| `uf_full_k1` | cross_view residual | on | on | to run |
 
-K=3 versions follow only for arms that matter after the K=1 verdict.
+The reg-only → reg+clf → reg+corr → full ladder attributes each component
+against the same controls; no corr-only arm (correlation needs a fusion conv
+to enter) and no clf-only arm (no disparity cue). K=3 versions follow only
+for arms that matter after the K=1 verdict.
 
 **Common flags** (dev box, host-RAM bound — or the SLURM harness):
 
@@ -144,9 +149,10 @@ python main.py --dataset stereobj-1m --stereo_mode stereo \
 ```
 
 Arm-specific: `left_only`/`mean` add `--fusion left_only|mean
---no-clf_fusion --no-fusion_corr`; full uses dataset defaults (clf+corr on);
-reg-only (already run) used `--no-clf_fusion --no-fusion_corr`. No
-`--freeze_except_stereo` on primary arms.
+--no-clf_fusion --no-fusion_corr`; `uf_reg_k1` adds `--no-clf_fusion
+--no-fusion_corr`; `uf_regclf_k1` adds `--no-fusion_corr`; `uf_regcorr_k1`
+adds `--no-clf_fusion`; `uf_full_k1` uses dataset defaults (clf+corr on).
+No `--freeze_except_stereo` on primary arms.
 
 On the cluster: stereobj-1m is ~24 h/epoch full-train — the primary matrix is
 4 single-epoch jobs (`TIME` per job; `SAVE_EVERY_STEPS` checkpoints are the
@@ -172,17 +178,19 @@ recovery point — `main.py` has no resume).
   `NUM_WORKERS` default 2).
 
 **Priority order.**
-1. `left_only` K=1 and `mean` K=1 (controls) + `full` K=1 — the three missing
-   primary arms vs the completed reg-only row.
+1. The full primary matrix: controls (`left_only`, `mean`) + component ladder
+   (`uf_reg_k1`, `uf_regclf_k1`, `uf_regcorr_k1`, `uf_full_k1`) — 6 runs,
+   all resumed from mono ep1.
 2. Step-0 stereo evals for resumed runs (cheap, interprets everything else).
 3. K=3 versions of the winning arm(s).
 4. Winner → usprobe corollary (`--dataset usprobe --stereo_mode stereo
    --pretrained <usprobe-mono-ep>`), eval via `inference_usprobe_stereo.py`.
 5. Optional: frozen matrix for cheap per-component attribution.
 
-Decision rule: full > reg-only > controls → clf/corr earn their keep;
-reg-only ≈ controls → the gain is data/operating-point, not fusion; any arm
-< its step-0 control → that pathway hurts at this training budget.
+Decision rule: read the ladder against the controls — reg-only > controls →
+the learned fusion earns its keep; reg+clf/reg+corr > reg-only → that
+component adds; full ≈ best single-component arm → no stacking benefit. Any
+arm < its step-0 control → that pathway hurts at this training budget.
 
 **Budget (rough).** Dev box at batch 4: unfrozen stereo K=1 ~1.5–2 h/epoch
 (forward + full backward), K=3 ~2.5–3× K=1; cluster ~24 h/epoch full-train is
