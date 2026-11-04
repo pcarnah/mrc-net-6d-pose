@@ -46,6 +46,11 @@ class BOP_Dataset(PoseDataset):
         self.height = cfg.DATASET_CONFIG[dataset_name]['height']
         self.color_type = cfg.DATASET_CONFIG[dataset_name]['color_type']
         self.split = split
+        # 'mono' (default) or 'stereo'.  Only usprobe sets 'stereo'; every
+        # other BOP dataset stays mono, so its index/read path is unchanged.
+        # Subclasses (usprobe_dataset.UsprobeDataset) branch on this.
+        self.stereo_mode = cfg.DATASET_CONFIG[dataset_name].get(
+            'stereo_mode', 'mono')
 
         self.depth_min = cfg.DATASET_CONFIG[dataset_name]['Tz_near']
         self.depth_max = cfg.DATASET_CONFIG[dataset_name]['Tz_far']
@@ -95,9 +100,14 @@ class BOP_Dataset(PoseDataset):
         self.use_cache = cfg.USE_CACHE
         self.cache_dir = os.path.join(CUR_FILE_DIR, ".cache")  # .cache
 
+        # The stereo index carries extra per-instance right-eye fields, so it
+        # must not share the mono cache.  Mono keeps its original key (the tag
+        # is empty) so existing caches stay valid.
+        stereo_tag = '' if self.stereo_mode == 'mono' else '_' + self.stereo_mode
         hashed_file_name = hashlib.md5(("_".join(self.name_set)
-            + "dataset_dicts_{}_{}_{}_{}".format(
-                SCHEMA_VERSION, self.dataset_name, self.data_dir, __name__)
+            + "dataset_dicts_{}_{}_{}_{}{}".format(
+                SCHEMA_VERSION, self.dataset_name, self.data_dir, __name__,
+                stereo_tag)
         ).encode("utf-8")).hexdigest()
         cache_path = os.path.join(self.cache_dir,
             "dataset_dicts_{}_{}_{}.pkl".format(self.dataset_name, "_".join(self.name_set), hashed_file_name))
@@ -110,114 +120,9 @@ class BOP_Dataset(PoseDataset):
             self.dataset_dicts = file_io.load(cache_path)
             # print('done')
         else:
-            for img_type in self.name_set:
-                image_counter = 0
-                instance_counter = 0
-                train_dir = os.path.join(self.data_dir, img_type)
-                logger.info("preparing data from {}".format(img_type))
-                model_folder = os.path.join(self.data_dir, self.model_folders[img_type])
-
-                ## process scene and images ############
-                for scene in sorted(os.listdir(train_dir)):  # scene
-                    if not scene.startswith('00'):  # BOP images start with '0000xx'
-                        continue
-                    scene_id = int(scene)
-                    scene_dir = os.path.join(train_dir, scene)
-                    scene_cam_dict = file_io.load(os.path.join(scene_dir, "scene_camera.json"))      # gt_intrinsic
-                    scene_gt_pose_dict = file_io.load(os.path.join(scene_dir, "scene_gt.json"))      # gt_poses
-                    scene_gt_bbox_dict = file_io.load(os.path.join(scene_dir, "scene_gt_info.json"))  # gt_bboxes
-                    for img_id_str in tqdm(scene_gt_pose_dict, postfix=f"{scene_id}"):  # image
-                        img_id_int = int(img_id_str)
-                        color_type = self.color_type
-                        rgb_path = os.path.join(scene_dir, "{}/{:06d}.jpg").format(color_type, img_id_int)
-                        if not os.path.exists(rgb_path):
-                            rgb_path = os.path.join(scene_dir, "{}/{:06d}.png").format(color_type, img_id_int)
-                        if not os.path.exists(rgb_path):
-                            rgb_path = os.path.join(scene_dir, "{}/{:06d}.tif").format(color_type, img_id_int)
-                        if not os.path.exists(rgb_path):
-                            rgb_path = os.path.join(scene_dir, "{}/{:06d}.bmp").format(color_type, img_id_int)
-                        assert os.path.exists(rgb_path), rgb_path
-                        cam_K = np.array(scene_cam_dict[img_id_str]["cam_K"], dtype=np.float32).reshape(3, 3)
-
-                        record = {
-                            "dataset_name": self.dataset_name,
-                            "scene_id": scene_id,
-                            "image_id": img_id_int,
-                            "img_type": img_type,
-                            "height": self.height,
-                            "width": self.width,
-                        }
-                        view_insts = []
-                        view_inst_count = dict() # count the object number per instance in a single image
-                        for anno_idx, anno_dict in enumerate(scene_gt_pose_dict[img_id_str]):
-                            obj_id = anno_dict["obj_id"]
-                            if obj_id not in self.dataset_id2cls: # ignore the non-target objects 
-                                continue
-                            R = np.array(anno_dict["cam_R_m2c"], dtype="float32").reshape(3, 3)
-                            t = np.array(anno_dict["cam_t_m2c"], dtype="float32")
-
-                            quat_path = os.path.join(scene_dir, "quat_label/{:06d}_{:06d}.npy").format(img_id_int, anno_idx)
-
-                            bbox_visib = scene_gt_bbox_dict[img_id_str][anno_idx]["bbox_visib"]
-                            x1, y1, w, h = bbox_visib
-                            if self.filter_invalid:
-                                if h <= 10 or w <= 10:
-                                    continue
-                            ### Load precompute quaternion bin id and residual #########
-                            model_path = os.path.join(
-                                model_folder, 'obj_{:06d}.ply'.format(int(obj_id)))
-
-                            mask_visib_file = os.path.join(scene_dir, "mask_visib/{:06d}_{:06d}.png".format(img_id_int, anno_idx))
-                            assert os.path.exists(mask_visib_file), mask_visib_file
-                            visib_fract = scene_gt_bbox_dict[img_id_str][anno_idx]["visib_fract"]
-                            if visib_fract < 0.10:  # filter out too small or nearly invisible instances
-                                continue
-
-                            if cfg.CACHE_MASK:
-                                mask_single = file_io.imread(mask_visib_file, "unchanged").astype(bool).astype(np.uint8)
-                                if self.mask_morph:
-                                    kernel = np.ones((self.mask_morph_kernel_size, self.mask_morph_kernel_size))
-                                    mask_single = cv2.morphologyEx(mask_single.astype(np.uint8), cv2.MORPH_CLOSE, kernel)  # remove holes
-                                    mask_single = cv2.morphologyEx(mask_single, cv2.MORPH_OPEN, kernel)  # remove outliers
-                                mask_single = misc.binary_mask_to_rle(mask_single, compressed=True)
-
-                            else:
-                                mask_single = mask_visib_file
-
-                            if obj_id not in view_inst_count:
-                                view_inst_count[obj_id] = 0
-                            view_inst_count[obj_id] += 1  # accumulate the object number per instance in a single image
-
-                            # Object instance level information dict
-                            inst = {
-                                'sub_dataset_folder': img_type,
-                                'image_file': rgb_path,
-                                'mask_file': mask_single,
-                                'model_file': model_path,
-                                'bbox': bbox_visib,
-                                'quat_file': quat_path,
-                                'rotation': R,
-                                'translation': t,
-                                'intrinsics': cam_K,
-                                'scene_id': scene_id,
-                                'im_id': img_id_int,
-                                'obj_id': int(obj_id),
-                            }
-
-                            view_insts.append(inst)
-                        if len(view_insts) == 0:  # filter im without anno
-                            continue
-                        record["annotations"] = view_insts
-                        record['obj_inst_count'] = view_inst_count
-                        self.dataset_dicts.append(record)
-
-                        image_counter += 1
-                        instance_counter += len(view_insts)
-
-                    print(img_type, ', images: ', image_counter, ', instances: ', instance_counter)
-
-                file_io.dump(self.dataset_dicts, cache_path, protocol=5)
-                logger.info("Dumped dataset_dicts to {}".format(cache_path))
+            self.dataset_dicts = self._build_image_records()
+            file_io.dump(self.dataset_dicts, cache_path, protocol=5)
+            logger.info("Dumped dataset_dicts to {}".format(cache_path))
 
         self.dataset_dicts = misc.flat_dataset_dicts(self.dataset_dicts) # flatten the image-level dict to instance-level dict
 
@@ -228,6 +133,140 @@ class BOP_Dataset(PoseDataset):
             np.save(self.quat_label_path, labels.astype(np.float16))
             logger.info("Saved quaternion labels to {}".format(
                 self.quat_label_path))
+
+    def _resolve_image_path(self, scene_dir, img_id_int):
+        """First existing ``<color_type>/<img>.<ext>`` for a BOP scene image.
+
+        Cascade mirrors the historical BOP layout: rgb/jpg -> png -> tif ->
+        bmp (usprobe mixes .bmp and .png across scenes).
+        """
+        for ext in ('jpg', 'png', 'tif', 'bmp'):
+            path = os.path.join(
+                scene_dir, "{}/{:06d}.{}".format(
+                    self.color_type, img_id_int, ext))
+            if os.path.exists(path):
+                return path
+        raise AssertionError(
+            'no image for scene {} image {}'.format(scene_dir, img_id_int))
+
+    def _load_mask_rle(self, mask_visib_file):
+        """Load a mask_visib png and return it as (compressed) RLE or a path.
+
+        Mirrors the historical ``CACHE_MASK`` behaviour: with the cache on the
+        mask is morphologically cleaned and RLE-encoded; otherwise the file
+        path is stored and decoded at read time.
+        """
+        if not cfg.CACHE_MASK:
+            return mask_visib_file
+        mask_single = file_io.imread(
+            mask_visib_file, "unchanged").astype(bool).astype(np.uint8)
+        if self.mask_morph:
+            kernel = np.ones(
+                (self.mask_morph_kernel_size, self.mask_morph_kernel_size))
+            mask_single = cv2.morphologyEx(
+                mask_single.astype(np.uint8), cv2.MORPH_CLOSE, kernel)  # remove holes
+            mask_single = cv2.morphologyEx(
+                mask_single, cv2.MORPH_OPEN, kernel)  # remove outliers
+        return misc.binary_mask_to_rle(mask_single, compressed=True)
+
+    def _build_image_records(self):
+        """Build the image-level records for the mono BOP layout.
+
+        Returns a list of per-image dicts, each holding an ``annotations``
+        list of instance dicts (see ``flat_dataset_dicts``).  Subclasses
+        override this to change the index (e.g. usprobe stereo scene pairs).
+        """
+        dataset_dicts = []
+        for img_type in self.name_set:
+            image_counter = 0
+            instance_counter = 0
+            train_dir = os.path.join(self.data_dir, img_type)
+            logger.info("preparing data from {}".format(img_type))
+            model_folder = os.path.join(self.data_dir, self.model_folders[img_type])
+
+            ## process scene and images ############
+            for scene in sorted(os.listdir(train_dir)):  # scene
+                if not scene.startswith('00'):  # BOP images start with '0000xx'
+                    continue
+                scene_id = int(scene)
+                scene_dir = os.path.join(train_dir, scene)
+                scene_cam_dict = file_io.load(os.path.join(scene_dir, "scene_camera.json"))      # gt_intrinsic
+                scene_gt_pose_dict = file_io.load(os.path.join(scene_dir, "scene_gt.json"))      # gt_poses
+                scene_gt_bbox_dict = file_io.load(os.path.join(scene_dir, "scene_gt_info.json"))  # gt_bboxes
+                for img_id_str in tqdm(scene_gt_pose_dict, postfix=f"{scene_id}"):  # image
+                    img_id_int = int(img_id_str)
+                    rgb_path = self._resolve_image_path(scene_dir, img_id_int)
+                    cam_K = np.array(scene_cam_dict[img_id_str]["cam_K"], dtype=np.float32).reshape(3, 3)
+
+                    record = {
+                        "dataset_name": self.dataset_name,
+                        "scene_id": scene_id,
+                        "image_id": img_id_int,
+                        "img_type": img_type,
+                        "height": self.height,
+                        "width": self.width,
+                    }
+                    view_insts = []
+                    view_inst_count = dict() # count the object number per instance in a single image
+                    for anno_idx, anno_dict in enumerate(scene_gt_pose_dict[img_id_str]):
+                        obj_id = anno_dict["obj_id"]
+                        if obj_id not in self.dataset_id2cls: # ignore the non-target objects 
+                            continue
+                        R = np.array(anno_dict["cam_R_m2c"], dtype="float32").reshape(3, 3)
+                        t = np.array(anno_dict["cam_t_m2c"], dtype="float32")
+
+                        quat_path = os.path.join(scene_dir, "quat_label/{:06d}_{:06d}.npy").format(img_id_int, anno_idx)
+
+                        bbox_visib = scene_gt_bbox_dict[img_id_str][anno_idx]["bbox_visib"]
+                        x1, y1, w, h = bbox_visib
+                        if self.filter_invalid:
+                            if h <= 10 or w <= 10:
+                                continue
+                        ### Load precompute quaternion bin id and residual #########
+                        model_path = os.path.join(
+                            model_folder, 'obj_{:06d}.ply'.format(int(obj_id)))
+
+                        mask_visib_file = os.path.join(scene_dir, "mask_visib/{:06d}_{:06d}.png".format(img_id_int, anno_idx))
+                        assert os.path.exists(mask_visib_file), mask_visib_file
+                        visib_fract = scene_gt_bbox_dict[img_id_str][anno_idx]["visib_fract"]
+                        if visib_fract < 0.10:  # filter out too small or nearly invisible instances
+                            continue
+
+                        mask_single = self._load_mask_rle(mask_visib_file)
+
+                        if obj_id not in view_inst_count:
+                            view_inst_count[obj_id] = 0
+                        view_inst_count[obj_id] += 1  # accumulate the object number per instance in a single image
+
+                        # Object instance level information dict
+                        inst = {
+                            'sub_dataset_folder': img_type,
+                            'image_file': rgb_path,
+                            'mask_file': mask_single,
+                            'model_file': model_path,
+                            'bbox': bbox_visib,
+                            'quat_file': quat_path,
+                            'rotation': R,
+                            'translation': t,
+                            'intrinsics': cam_K,
+                            'scene_id': scene_id,
+                            'im_id': img_id_int,
+                            'obj_id': int(obj_id),
+                        }
+
+                        view_insts.append(inst)
+                    if len(view_insts) == 0:  # filter im without anno
+                        continue
+                    record["annotations"] = view_insts
+                    record['obj_inst_count'] = view_inst_count
+                    dataset_dicts.append(record)
+
+                    image_counter += 1
+                    instance_counter += len(view_insts)
+
+                print(img_type, ', images: ', image_counter, ', instances: ', instance_counter)
+
+        return dataset_dicts
 
     def _instance_fingerprint(self):
         """sha256 over the ordered (obj_id, R, t) of every instance."""

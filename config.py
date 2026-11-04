@@ -266,6 +266,18 @@ DATASET_CONFIG = {
             'train_pbr': 'models',
             'test': 'models_eval'
         },
+        # Usprobe scenes are recorded as consecutive left/right pairs:
+        # scene 2k is the left eye, scene 2k+1 the matched right eye of the
+        # same capture (see train_df.csv / test_df.csv).  The adapter pairs
+        # them and, in stereo mode, returns both-eye crops plus the rig
+        # transform T_right_ref (mirrors stereobj-1m).  'mono' (default)
+        # keeps the original BOP_Dataset behaviour exactly.
+        'loader': 'usprobe',
+        'stereo_scene_pairs': True,
+        'stereo_mode': 'mono',
+        'stereo_fusion': False,
+        'fusion_mode': 'cross_view',
+        'fusion_residual': True,
         'train_set': ['train'],
         'test_set': ['test'],
     }
