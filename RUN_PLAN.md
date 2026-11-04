@@ -146,6 +146,24 @@ budget accordingly (`TIME`, `N_EPOCHS`, `SAVE_EVERY_STEPS=2000`,
 Arm-specific: reg-only adds `--no-clf_fusion --no-fusion_corr`; reg+clf adds
 `--no-fusion_corr`; reg+corr adds `--no-clf_fusion`; full uses defaults.
 
+**Fusion-mode baselines (secondary axis, frozen K=1).** `--fusion` ablates
+*how* the views are combined (`cross_view`/`mean`/`left_only`/`right_only`),
+orthogonal to the clf/corr component axis above. Two cheap arms slot in
+right after the reg-only frozen anchor, with `--no-clf_fusion
+--no-fusion_corr` so they compare cleanly on the reg axis:
+
+- `left_only` — the honest no-reg-fusion control (no cross-view regression
+  pathway at all; the matrix's reg-only arm is a zero-init *learned*
+  residual, which is not the same baseline).
+- `mean` — fixed `0.5·(left+right)` averaging, no learned fusion params;
+  tests whether the learned conv beats simple averaging.
+
+`right_only` (regressor on the right eye alone) is low-value; skip. Both
+arms bypass `stereo_fuse` entirely, so a frozen run trains only the
+regressor; the reg-side correlation is inert under non-cross_view modes;
+`left_only` still computes the right synthetic branch per iteration (known
+wasted compute, ablation-only).
+
 **Eval.** Per arm at its training K, on the stereobj-1m val split:
 
 ```
@@ -171,8 +189,9 @@ sanity eval of any frozen run must reproduce mono numbers bit-for-bit
 1. full K=1, full K=3 — "does clf+corr help at all" vs reg-only.
 2. reg+clf K=1, reg+corr K=1 — attribute the gain.
 3. reg-only frozen K=1 — the frozen anchor.
-4. Remaining K=3 arms.
-5. Winner → usprobe corollary: train the winning config on usprobe
+4. `left_only` K=1, `mean` K=1 — fusion-mode baselines for the reg axis.
+5. Remaining K=3 arms.
+6. Winner → usprobe corollary: train the winning config on usprobe
    (`--dataset usprobe --stereo_mode stereo --pretrained <usprobe-mono-ep>`,
    same frozen protocol), eval usprobe test via `inference_usprobe_stereo.py`.
 
