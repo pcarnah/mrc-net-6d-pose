@@ -65,8 +65,8 @@ submit() {
 }
 
 # Sources: the stereobj-1m mono-K1 run; every primary arm resumes from its
-# epoch_001 checkpoint (adjust the file name to the actual save).
-PRETRAINED_MONO_K1="${PRETRAINED_MONO_K1:-chkpt_stereobj-1m_mono_K1/epoch_001.pth}"
+# epoch_002 checkpoint (adjust the file name to the actual save).
+PRETRAINED_MONO_K1="${PRETRAINED_MONO_K1:-chkpt_stereobj-1m_mono_K1/epoch_002.pth}"
 PRETRAINED_MONO_K3="${PRETRAINED_MONO_K3:-chkpt_stereobj-1m_mono_K3/epoch_001.pth}"
 
 # --- Mono source (dependency for every primary arm; 3 epochs per plan) ------

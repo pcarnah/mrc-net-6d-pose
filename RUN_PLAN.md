@@ -95,7 +95,10 @@ smoke). Usprobe pairing: `tools/check_usprobe_stereo.py`.
   **stereobj-1m** (its `DATASET_CONFIG` defaults: `stereo_mode='stereo'`,
   `fusion_residual`/`clf_fusion`/`fusion_corr` all True; annotated eval split
   is `val` — webds test shards carry images only). The stereobj-1m mono-K1
-  source is a dependency: all primary arms resume from its `epoch_001.pth`.
+  source is a dependency: all primary arms resume from its `epoch_002.pth`
+  (the round recorded in §4b resumed from `epoch_001.pth` — its rows and the
+  resid reference run are epoch_001-based; the uf_* ladder re-runs reg-only
+  so the whole matrix shares the epoch_002 source).
 
 ## 4. Ablation plan v2 (unfrozen primary + controls — stereobj-1m)
 
@@ -103,7 +106,8 @@ smoke). Usprobe pairing: `tools/check_usprobe_stereo.py`.
 why the protocol changed):
 
 1. **Unfrozen is the primary protocol.** The unfrozen reg-only run (1 epoch
-   from mono ep1) is the best row in the matched comparison; the frozen full
+   from mono ep1) is the best row in the matched comparison of the
+   epoch_001-source round; the frozen full
    arm is still below its init at a partial epoch. A frozen mono-trained
    trunk likely caps late fusion (no co-adaptation), and per unit of insight
    unfrozen is currently cheaper (best-in-table in one epoch vs below-init at
@@ -122,7 +126,7 @@ why the protocol changed):
    the winning config on usprobe from the usprobe mono checkpoint.
 
 **Primary matrix (unfrozen, 1 epoch, K=1, all resumed from mono-K1
-`epoch_001.pth`).**
+`epoch_002.pth`).**
 
 | arm | fusion | clf | corr | status |
 |---|---|---|---|---|
@@ -142,7 +146,7 @@ for arms that matter after the K=1 verdict.
 
 ```
 python main.py --dataset stereobj-1m --stereo_mode stereo \
-    --pretrained chkpt_stereobj-1m_mono_K1/epoch_001.pth \
+    --pretrained chkpt_stereobj-1m_mono_K1/epoch_002.pth \
     --batch_size 4 --num_workers 0 --warmup_step 100 \
     --save_every_steps 500 --save_every_epochs 1 --no_compile \
     --chkpt_dir chkpt_stereobj-1m_uf_<arm>_k1 --log_dir logs_uf_<arm>_k1
@@ -180,7 +184,9 @@ recovery point — `main.py` has no resume).
 **Priority order.**
 1. The full primary matrix: controls (`left_only`, `mean`) + component ladder
    (`uf_reg_k1`, `uf_regclf_k1`, `uf_regcorr_k1`, `uf_full_k1`) — 6 runs,
-   all resumed from mono ep1.
+   all resumed from mono ep2. The matched mono baseline for this round is a
+   mono epoch_002 eval (plus its step-0 stereo control) — produce it before
+   reading the ladder.
 2. Step-0 stereo evals for resumed runs (cheap, interprets everything else).
 3. K=3 versions of the winning arm(s).
 4. Winner → usprobe corollary (`--dataset usprobe --stereo_mode stereo
