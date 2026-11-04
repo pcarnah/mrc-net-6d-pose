@@ -27,13 +27,13 @@ cd "$(dirname "$0")/../.."
 
 SBATCH="${SBATCH:-sbatch}"
 DRY_RUN="${DRY_RUN:-0}"
-TIME="${TIME:-48:00:00}"
-N_EPOCHS="${N_EPOCHS:-3}"
+TIME="${TIME:-24:00:00}"
+N_EPOCHS="${N_EPOCHS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-24}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
 WARMUP="${WARMUP:-1000}"
 N_GPUS="${N_GPUS:-1}"
-SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-5000}"
+SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-10000}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
 BF16="${BF16:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:---no_compile}"
@@ -59,19 +59,20 @@ submit() {
   fi
 }
 
-PRETRAINED="chkpt_ycbv-ds/ycbv_real.pth"
+PRETRAINED_K1="chkpt_stereobj-1m_mono_K1/epoch_001.pth"
+#PRETRAINED="chkpt_ycbv-ds/ycbv_real.pth"
 # --- Main model + train-K vs test-K' ---------------------------------------
-submit stereo_cross_K3 stereobj-1m stereo cross_view 3 "$PRETRAINED"
-submit stereo_cross_K1 stereobj-1m stereo cross_view 1 "$PRETRAINED"
+#submit stereo_cross_K3 stereobj-1m stereo cross_view 3 "$PRETRAINED"
+submit stereo_cross_K1_resid stereobj-1m stereo cross_view 1 "$PRETRAINED_K1"
 
 # --- Fusion ablations (at the main K=3) ------------------------------------
-submit stereo_mean_K3  stereobj-1m stereo mean      3 "$PRETRAINED"
-submit stereo_left_K3  stereobj-1m stereo left_only 3 "$PRETRAINED"
-submit stereo_right_K3 stereobj-1m stereo right_only 3 "$PRETRAINED"
+#submit stereo_mean_K3  stereobj-1m stereo mean      3 "$PRETRAINED"
+#submit stereo_left_K3  stereobj-1m stereo left_only 3 "$PRETRAINED"
+#submit stereo_right_K3 stereobj-1m stereo right_only 3 "$PRETRAINED"
 
 # --- Mono arm (same schedule) ----------------------------------------------
-submit mono_K1 stereobj-1m mono "" 1 "$PRETRAINED"
-submit mono_K3 stereobj-1m mono "" 3 "$PRETRAINED"
+#submit mono_K1 stereobj-1m mono "" 1 "$PRETRAINED"
+#submit mono_K3 stereobj-1m mono "" 3 "$PRETRAINED"
 
 # --- Probe transfer (fine-tune on the probe training split) -----------------
 # Mono arm: init from the mono stereobj-1m model, matched schedule.

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=mrcnet-train
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus=h100_3g.40gb:1
+#SBATCH --gpus=a100:1
 #SBATCH --time=1:00:00
 #SBATCH --mem=60G
 #SBATCH --output=logs/slurm/%x-%j.out
