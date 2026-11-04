@@ -410,6 +410,20 @@ class MRCNet(nn.Module):
                 self.stereo_fuse = ConvGnReLU(
                     4096, 2048, kernel_size=3, padding=1)
 
+        # Residual classifier fusion: clf_pool = left + zero-init
+        # GN(conv(cat(left, right))) feeding the unchanged ClassificationHead,
+        # mirroring the residual reg fusion. Zero init keeps the classifier's
+        # input equal to the left view at init, so the bootstrap starts at
+        # mono performance and the classification losses learn the cross-view
+        # correction. New parameters live only in ``stereo_fuse_clf.*``.
+        self.clf_fusion = bool(getattr(cfg, 'clf_fusion', False))
+        if self.stereo_fusion and self.clf_fusion:
+            self.stereo_fuse_clf = nn.Sequential(
+                nn.Conv2d(2048, 1024, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(32, 1024))
+            nn.init.zeros_(self.stereo_fuse_clf[1].weight)
+            nn.init.zeros_(self.stereo_fuse_clf[1].bias)
+
     def _make_predictions(self, mask_real, mask_synt, pose_logits,
                           depth_logits, trans_logits, pose_res,
                           depth_res, trans_res):
@@ -670,15 +684,14 @@ class MRCNet(nn.Module):
                 "whose ModelConfig matches the dataset stereo_mode.".format(
                     stereo, self.stereo_fusion))
 
-        # Classification bootstrap: unchanged, always mono left and always
-        # iteration 0. In stereo the right-eye real features are computed
-        # once and reused by every refinement iteration.
+        # Classification bootstrap: always iteration 0. Mono by default; with
+        # ``clf_fusion`` the classifier consumes a zero-init residual over both
+        # eyes' ``clf_pool`` (the right-eye features are computed once and
+        # reused by every refinement iteration).
         x1, mask_real = self.backbone(inputs, aux['obj_cls'])
         x_real_in = torch.concat([x1, mask_real.detach().sigmoid()], dim=1)
         x_clf = self.decoder(x_real_in)
         x_clf['fov'] = aux['fov']
-        pose_logits, depth_logits, trans_logits = self.classifier(x_clf)
-        image_size = (cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE)
 
         x_clf_right = None
         if stereo:
@@ -688,6 +701,13 @@ class MRCNet(nn.Module):
                 [x1r, mask_real_r.detach().sigmoid()], dim=1)
             x_clf_right = self.decoder(x_real_in_r)
             x_clf_right['fov'] = aux['fov_right']
+            if self.clf_fusion:
+                clf_pool = x_clf['clf_pool'] + self.stereo_fuse_clf(torch.cat(
+                    [x_clf['clf_pool'], x_clf_right['clf_pool']], dim=1))
+                x_clf = dict(x_clf, clf_pool=clf_pool)
+
+        pose_logits, depth_logits, trans_logits = self.classifier(x_clf)
+        image_size = (cfg.INPUT_IMG_SIZE, cfg.INPUT_IMG_SIZE)
 
         with torch.no_grad():
             depth_id = torch.argmax(depth_logits, dim=-1)

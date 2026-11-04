@@ -12,13 +12,16 @@ Mono behaviour is gated separately by ``tools/regression_guard.py`` and
      concat order, left-fov regressor.)
   2. Random-init fusion: every prediction/loss finite at K=1..3 with the
      expected per-iteration loss keys present.
-  3. Training-mode backward: finite gradients reach ``stereo_fuse`` and the
-     shared backbone/regressor.
-  4. Informational only: render geometrically consistent stereo observations at
-     a known baseline, perturb the classification bootstrap and report the
-     mono-vs-stereo depth error (fusion is untrained -> no improvement assert).
-  5. Dataset smoke (skipped when no shards on disk): key presence/shapes,
-     rig-transform consistency and the left->right projection identity.
+3. **clf fusion:** the ``clf_pool`` residual fusion must be a zero-init
+      identity vs ``clf_fusion=False`` and receive gradient from the
+      iteration-0 classification losses (GN gamma first).
+  4. Training-mode backward: finite gradients reach ``stereo_fuse`` and the
+      shared backbone/regressor.
+  5. Informational only: render geometrically consistent stereo observations at
+      a known baseline, perturb the classification bootstrap and report the
+      mono-vs-stereo depth error (fusion is untrained -> no improvement assert).
+  6. Dataset smoke (skipped when no shards on disk): key presence/shapes,
+      rig-transform consistency and the left->right projection identity.
 
 Uses the fixed usprobe batch/checkpoint from ``tools/regression_guard.py``.
 """
@@ -60,10 +63,12 @@ class ZeroResidual(torch.nn.Module):
         return torch.zeros_like(x[:, :REG_CHANNELS])
 
 
-def build_stereo_model(device, load_mono=True):
+def build_stereo_model(device, load_mono=True, clf_fusion=None):
     model_config = dataclasses.replace(
         cfg.ModelConfig.from_dataset_config(guard.DATASET),
         stereo_fusion=True, fusion_residual=True)
+    if clf_fusion is not None:
+        model_config = dataclasses.replace(model_config, clf_fusion=clf_fusion)
     model = models.MRCNet(model_config).to(device)
     if load_mono:
         checkpoint = torch.load(
@@ -178,6 +183,67 @@ def check_random_fusion(device):
                 failures.append('K={} non-finite loss {}'.format(k, key))
         print('K={} stereo predictions/losses: {} ({} loss keys)'.format(
             k, 'OK' if not failures else 'FAIL', len(preds['losses'])))
+    return failures
+
+
+def check_clf_fusion(device):
+    """clf_pool residual fusion: zero-init identity + gradient reach.
+
+    At init the zeroed GN makes the fused ``clf_pool`` equal the left view
+    exactly, so a clf_fusion model must reproduce a clf_fusion=False model
+    bit-for-bit; the iteration-0 classification losses must then reach the
+    fusion (the GN gamma receives the first gradient, like the reg fusion).
+    """
+    failures = []
+    inputs, aux = build_stereo_aux(device)
+
+    base = build_stereo_model(device, clf_fusion=False)
+    base_preds = run_forward(base, inputs, aux)
+    base_preds = {k: v.detach().cpu().float() for k, v in base_preds.items()}
+    del base
+    torch.cuda.empty_cache()
+
+    model = build_stereo_model(device, clf_fusion=True)
+    if not hasattr(model, 'stereo_fuse_clf'):
+        failures.append('clf_fusion model has no stereo_fuse_clf')
+        return failures
+    gn = model.stereo_fuse_clf[1]
+    if float(gn.weight.detach().abs().max()) != 0.0 \
+            or float(gn.bias.detach().abs().max()) != 0.0:
+        failures.append('stereo_fuse_clf GN not zero-initialised')
+
+    preds = run_forward(model, inputs, aux)
+    identity_ok = True
+    for key in guard.PRED_KEYS:
+        a = base_preds[key]
+        b = preds[key].detach().cpu().float()
+        if not torch.allclose(a, b, rtol=1e-4, atol=1e-5):
+            identity_ok = False
+            failures.append('clf zero-init identity {} diff={:.3e}'.format(
+                key, float((a - b).abs().max())))
+    print('clf zero-init identity vs clf_fusion=False: {}'.format(
+        'OK' if identity_ok else 'FAIL'))
+
+    torch.use_deterministic_algorithms(False)
+    targets = guard.build_targets(device, aux)
+    model.train()
+    model.zero_grad(set_to_none=True)
+    preds = model(inputs, aux, targets, n_refine_iters=1)
+    loss = sum(preds['losses'].values())
+    if not torch.isfinite(loss):
+        failures.append('clf backward: non-finite loss')
+    else:
+        loss.backward()
+        gn_grad = gn.weight.grad
+        if gn_grad is None or not torch.isfinite(gn_grad.float()).all():
+            failures.append('stereo_fuse_clf GN grad missing/non-finite')
+        elif float(gn_grad.float().abs().max()) == 0.0:
+            failures.append('stereo_fuse_clf GN gamma grad is zero')
+        else:
+            print('clf backward: loss={:.4f} GN gamma |grad|max={:.3e}'.format(
+                float(loss.detach()), float(gn_grad.float().abs().max())))
+    model.zero_grad(set_to_none=True)
+    model.eval()
     return failures
 
 
@@ -338,8 +404,8 @@ def main():
 
     guard.setup_determinism()
     failures = []
-    for check in (check_passthrough, check_random_fusion, check_backward,
-                  check_geometry, check_dataset_smoke):
+    for check in (check_passthrough, check_random_fusion, check_clf_fusion,
+                  check_backward, check_geometry, check_dataset_smoke):
         failures += check(device)
         if device == 'cuda':
             # Stereo models are large and every check builds fresh ones.

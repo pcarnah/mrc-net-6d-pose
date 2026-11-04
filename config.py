@@ -245,12 +245,17 @@ DATASET_CONFIG = {
         # eyes; __getitem__ returns the left-eye PoseSample plus the right-eye
         # inputs (roi_image_right, bbox_map_right, roi_camK_right, fov_right)
         # and the per-sample rig transform T_right_ref. Targets stay in the
-        # left-camera frame. Only the residual-regression branch fuses both
-        # views (stereo_fusion=True); the classification bootstrap stays mono.
+        # left-camera frame. The residual-regression branch fuses both views
+        # (stereo_fusion=True); the classification bootstrap stays mono unless
+        # clf_fusion is set.
         'stereo_mode': 'stereo',
         'stereo_fusion': True,
         # Fusion operation; overridable per run via --fusion (see FUSION_MODES).
         'fusion_mode': 'cross_view',
+        # Residual classifier fusion (clf_pool = left + zero-init
+        # GN(conv(cat(left, right)))) for new training runs; old checkpoints
+        # carry clf_fusion=False in their model_config and rebuild without it.
+        'clf_fusion': True,
     },
     'usprobe': {
         'width': 1280,
@@ -278,6 +283,9 @@ DATASET_CONFIG = {
         'stereo_fusion': False,
         'fusion_mode': 'cross_view',
         'fusion_residual': True,
+        # Residual classifier fusion for stereo runs (inert while
+        # stereo_fusion is False); overridable per run via --clf_fusion.
+        'clf_fusion': True,
         'train_set': ['train'],
         'test_set': ['test'],
     }
@@ -341,10 +349,17 @@ class ModelConfig:
     # stereo branch starts at mono performance. Defaults to False so old
     # stereo checkpoints (ConvGnReLU fusion) rebuild and load identically.
     fusion_residual: bool = False
+    # Residual classifier fusion: clf_pool = left + zero-init
+    # GN(conv(cat(left, right))) feeding the unchanged ClassificationHead, so
+    # the bootstrap can use right-eye info. The zero init makes the fused
+    # tensor equal the left view at init (stereo-at-init = mono performance).
+    # Only built when stereo_fusion is also True. Defaults to False so old
+    # checkpoint model_config dicts rebuild identical state_dicts.
+    clf_fusion: bool = False
 
     @classmethod
     def from_dataset_config(cls, dataset, stereo_mode=None, fusion=None,
-                            fusion_residual=None):
+                            fusion_residual=None, clf_fusion=None):
         dataset_cfg = DATASET_CONFIG[dataset]
         stereo = dataset_cfg.get('stereo_fusion', False)
         if stereo_mode is not None:
@@ -355,6 +370,9 @@ class ModelConfig:
         residual = dataset_cfg.get('fusion_residual', False)
         if fusion_residual is not None:
             residual = fusion_residual
+        clf = dataset_cfg.get('clf_fusion', False)
+        if clf_fusion is not None:
+            clf = clf_fusion
         return cls(
             dataset=dataset,
             n_decoders=dataset_cfg['num_class'],
@@ -363,7 +381,8 @@ class ModelConfig:
             n_depth_bin=Tz_BINS_NUM,
             stereo_fusion=stereo,
             fusion_mode=fusion_mode,
-            fusion_residual=residual)
+            fusion_residual=residual,
+            clf_fusion=clf)
 
 
 def set_runtime_overrides(dataset, stereo_mode=None, fusion=None):

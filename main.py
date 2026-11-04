@@ -47,8 +47,8 @@ def match_weight_dict(d1, d2):
     return matched
 
 # Parameter prefixes kept trainable by --freeze_except_stereo: the stereo
-# fusion block and the regression head.
-TRAINABLE_PREFIXES = ('stereo_fuse.', 'regressor.')
+# fusion blocks (regression + classifier residual) and the regression head.
+TRAINABLE_PREFIXES = ('stereo_fuse.', 'stereo_fuse_clf.', 'regressor.')
 
 
 def freeze_except_stereo(model):
@@ -112,7 +112,7 @@ def main_worker(rank, world_size, args):
 
     model_config = bop_cfg.ModelConfig.from_dataset_config(
         args.dataset, stereo_mode=args.stereo_mode, fusion=args.fusion,
-        fusion_residual=args.fusion_residual)
+        fusion_residual=args.fusion_residual, clf_fusion=args.clf_fusion)
 
     if args.is_parallel:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset)
@@ -131,6 +131,12 @@ def main_worker(rank, world_size, args):
             print('WARNING: --freeze_except_stereo on a mono model (no '
                   'stereo_fuse block); only regressor stays trainable.')
         n_train, n_frozen = freeze_except_stereo(model)
+        if hasattr(model, 'stereo_fuse_clf'):
+            assert all(p.requires_grad
+                       for p in model.stereo_fuse_clf.parameters()), \
+                'stereo_fuse_clf must stay trainable under ' \
+                '--freeze_except_stereo (it is zero-init and would never ' \
+                'learn if frozen)'
         print('Froze {:,} params; training {:,} params '
               '(stereo fusion + regressor only).'.format(n_frozen, n_train))
     if not args.no_compile:
@@ -378,6 +384,15 @@ if __name__ == '__main__':
                              'block (stereo_fuse.*) and the regression head '
                              '(regressor.*); finetune those on top of a '
                              'pretrained checkpoint')
+    parser.add_argument('--clf_fusion',
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help='residual classifier fusion: clf_pool = left + '
+                             'GN(conv(cat(left, right))) with zeroed GN '
+                             'gamma/beta feeding the unchanged '
+                             'ClassificationHead, so the bootstrap sees '
+                             'right-eye info. Default: the dataset config '
+                             'value (stereobj-1m/usprobe: True). Checkpoints '
+                             'record the flag in model_config.')
     parser.add_argument('--seed', type=int, default=bop_cfg.RANDOM_SEED,
                         help='random seed (single-seed study by default)')
     parser.add_argument('--no_compile', action='store_true',
