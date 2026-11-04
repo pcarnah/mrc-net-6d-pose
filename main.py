@@ -46,6 +46,27 @@ def match_weight_dict(d1, d2):
 
     return matched
 
+# Parameter prefixes kept trainable by --freeze_except_stereo: the stereo
+# fusion block and the regression head.
+TRAINABLE_PREFIXES = ('stereo_fuse.', 'regressor.')
+
+
+def freeze_except_stereo(model):
+    """Freeze every parameter outside ``stereo_fuse`` and ``regressor``.
+
+    Returns (n_trainable, n_frozen) parameter counts.
+    """
+    trainable, frozen = 0, 0
+    for name, p in model.named_parameters():
+        keep = name.startswith(TRAINABLE_PREFIXES)
+        p.requires_grad = keep
+        if keep:
+            trainable += p.numel()
+        else:
+            frozen += p.numel()
+    return trainable, frozen
+
+
 def worker_init_fn(*_):
     # each worker should only use one os thread
     # numpy/cv2/torch take advantage of multithreading by default; left
@@ -105,6 +126,13 @@ def main_worker(rank, world_size, args):
         drop_last=True, sampler=train_sampler)
 
     model = models.MRCNet(model_config).to(rank)
+    if args.freeze_except_stereo:
+        if not hasattr(model, 'stereo_fuse'):
+            print('WARNING: --freeze_except_stereo on a mono model (no '
+                  'stereo_fuse block); only regressor stays trainable.')
+        n_train, n_frozen = freeze_except_stereo(model)
+        print('Froze {:,} params; training {:,} params '
+              '(stereo fusion + regressor only).'.format(n_frozen, n_train))
     if not args.no_compile:
         # torch.compile is lazy and can fail on boxes without a working
         # C/C++ toolchain; --no_compile runs eagerly instead.
@@ -140,6 +168,10 @@ def main_worker(rank, world_size, args):
         no_decay = set()
         for mn, md in model.named_modules():
             for pn, p in md.named_parameters():
+                if not p.requires_grad:
+                    # frozen by --freeze_except_stereo; keep out of the
+                    # optimizer entirely
+                    continue
                 if pn.endswith('bias'):
                     # all biases will not be decayed
                     no_decay.add(p)
@@ -150,8 +182,9 @@ def main_worker(rank, world_size, args):
                                      models.CondConv)):
                     decay.add(p)
 
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in model.named_parameters()}
+        # validate that we considered every trainable parameter
+        param_dict = {pn: p for pn, p in model.named_parameters()
+                      if p.requires_grad}
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0, \
@@ -191,6 +224,7 @@ def main_worker(rank, world_size, args):
             'dataset': args.dataset,
             'stereo_mode': args.stereo_mode,
             'fusion': args.fusion,
+            'freeze_except_stereo': args.freeze_except_stereo,
             'n_refine_iters': args.n_refine_iters,
             'seed': args.seed,
             'pretrained': args.pretrained,
@@ -339,6 +373,11 @@ if __name__ == '__main__':
                              'Default: the dataset config value '
                              '(stereobj-1m: True). Checkpoints record the '
                              'flag in model_config.')
+    parser.add_argument('--freeze_except_stereo', action='store_true',
+                        help='freeze every weight outside the stereo fusion '
+                             'block (stereo_fuse.*) and the regression head '
+                             '(regressor.*); finetune those on top of a '
+                             'pretrained checkpoint')
     parser.add_argument('--seed', type=int, default=bop_cfg.RANDOM_SEED,
                         help='random seed (single-seed study by default)')
     parser.add_argument('--no_compile', action='store_true',
