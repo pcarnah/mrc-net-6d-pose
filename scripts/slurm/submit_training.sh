@@ -71,8 +71,8 @@ PRETRAINED_MONO_K3="${PRETRAINED_MONO_K3:-chkpt_stereobj-1m_mono_K3/epoch_001.pt
 FREEZE_FLAGS="--freeze_except_stereo"
 
 # --- Mono sources (dependency for every frozen arm; 3 epochs per plan) ------
-(N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K1 stereobj-1m mono "" 1 "")
-(N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K3 stereobj-1m mono "" 3 "")
+# (N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K1 stereobj-1m mono "" 1 "")
+# (N_EPOCHS="${MONO_N_EPOCHS:-3}" submit mono_K3 stereobj-1m mono "" 3 "")
 
 # --- Frozen fusion-component matrix (stereobj-1m, 1 epoch per arm) ----------
 # reg-only / reg+clf / reg+corr / full, x K in {1,3}. All arms init from the
@@ -89,14 +89,14 @@ submit fr_regcorr_k1 stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
 submit fr_full_k1    stereobj-1m stereo cross_view 1 "$PRETRAINED_MONO_K1" \
   "" "" "$FREEZE_FLAGS"
 # K=3
-submit fr_reg_k3     stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-  "" "" "$FREEZE_FLAGS --no-clf_fusion --no-fusion_corr"
-submit fr_regclf_k3  stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-  "" "" "$FREEZE_FLAGS --no-fusion_corr"
-submit fr_regcorr_k3 stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-  "" "" "$FREEZE_FLAGS --no-clf_fusion"
-submit fr_full_k3    stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
-  "" "" "$FREEZE_FLAGS"
+# submit fr_reg_k3     stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
+#   "" "" "$FREEZE_FLAGS --no-clf_fusion --no-fusion_corr"
+# submit fr_regclf_k3  stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
+#   "" "" "$FREEZE_FLAGS --no-fusion_corr"
+# submit fr_regcorr_k3 stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
+#   "" "" "$FREEZE_FLAGS --no-clf_fusion"
+# submit fr_full_k3    stereobj-1m stereo cross_view 3 "$PRETRAINED_MONO_K3" \
+#   "" "" "$FREEZE_FLAGS"
 
 # --- Fusion-mode baselines (frozen K=1; reg axis only) ----------------------
 # left_only = honest no-reg-fusion control; mean = fixed averaging. Both
