@@ -255,10 +255,25 @@ def cocosegm2mask(segm, h, w):
     mask = rle2mask(rle, h, w)
     return mask
 
-def aug_bbox_DZI(bbox_xyxy, im_H, im_W, scale_ratio, shift_ratio, pad_scale, dyn_pad=False):
+def draw_dzi_randoms(scale_ratio, shift_ratio):
+    """Draw the DZI randoms (zoom multiplier, relative center shift).
+
+    Stereo loaders draw once and hand the result to both eyes via
+    ``aug_bbox_DZI(..., rnd=...)`` so the left/right crop pair keeps the
+    geometric correspondence eval builds from the per-eye GT boxes; mono
+    loaders keep drawing inside ``aug_bbox_DZI`` (unchanged RNG stream).
+    """
+    s = 1 + scale_ratio * (2 * np.random.random_sample() - 1)  # [1-0.25, 1+0.25]
+    shift = shift_ratio * (2 * np.random.random_sample(2) - 1)     # [-0.25, 0.25]
+    return s, shift
+
+def aug_bbox_DZI(bbox_xyxy, im_H, im_W, scale_ratio, shift_ratio, pad_scale, dyn_pad=False, rnd=None):
     """Used for DZI, the augmented box is a square (maybe enlarged)
     Args:
         bbox_xyxy (np.ndarray):
+        rnd: optional pre-drawn ``(scale, shift)`` from ``draw_dzi_randoms``;
+            shared between both eyes of a stereo pair instead of drawing
+            independently per eye.
     Returns:
             center, scale
     """
@@ -268,8 +283,9 @@ def aug_bbox_DZI(bbox_xyxy, im_H, im_W, scale_ratio, shift_ratio, pad_scale, dyn
     bh = y2 - y1
     bw = x2 - x1
 
-    scale_ratio = 1 + scale_ratio * (2 * np.random.random_sample() - 1)  # [1-0.25, 1+0.25]
-    shift_ratio = shift_ratio * (2 * np.random.random_sample(2) - 1)     # [-0.25, 0.25]
+    if rnd is None:
+        rnd = draw_dzi_randoms(scale_ratio, shift_ratio)
+    scale_ratio, shift_ratio = rnd[0], np.asarray(rnd[1])
     bbox_center = np.array([cx + bw * shift_ratio[0], cy + bh * shift_ratio[1]])  # (h/2, w/2)
     bh = bh * scale_ratio
     bw = bw * scale_ratio

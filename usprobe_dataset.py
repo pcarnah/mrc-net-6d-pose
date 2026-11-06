@@ -382,14 +382,19 @@ class UsprobeDataset(BOP_Dataset):
         return image, mask
 
     def _crop_eye(self, image, mask, cam_K, bbox_xyxy, rot_index,
-                  im_H, im_W):
-        """DZI crop one eye; mirrors ``BOP_Dataset.read_data``'s crop block."""
+                  im_H, im_W, dzi_rnd=None):
+        """DZI crop one eye; mirrors ``BOP_Dataset.read_data``'s crop block.
+
+        ``dzi_rnd=None`` draws the DZI zoom/pan per eye (mono path); stereo
+        passes one shared draw so both eyes keep the eval-time geometric
+        correspondence (each eye applies it relative to its own bbox).
+        """
         if self.split in ('train', 'finetune'):
             bbox_center, bbox_scale, bbox_loc = misc.aug_bbox_DZI(
                 bbox_xyxy, im_H, im_W,
                 scale_ratio=self.DZI_SCALE_RATIO,
                 shift_ratio=self.DZI_SHIFT_RATIO,
-                pad_scale=self.DZI_PAD_SCALE)
+                pad_scale=self.DZI_PAD_SCALE, rnd=dzi_rnd)
         else:
             x1, y1, x2, y2 = bbox_xyxy.copy()
             cx = 0.5 * (x1 + x2)
@@ -450,7 +455,14 @@ class UsprobeDataset(BOP_Dataset):
         }
 
     def read_data_stereo(self, dataset_dict, idx):
-        """Left-eye targets + right-eye inputs for one matched instance."""
+        """Left-eye targets + right-eye inputs for one matched instance.
+
+        Both eyes share one Rz crop index and one DZI draw (the same zoom
+        multiplier and relative pan applied to each eye's own bbox, so the
+        crop pair keeps the geometric correspondence eval builds from the
+        per-eye GT boxes); photometric augmentation stays per-eye
+        independent.
+        """
         info = dataset_dict['inst_infos']
 
         image_l = file_io.imread(
@@ -476,6 +488,8 @@ class UsprobeDataset(BOP_Dataset):
         # One shared Rz crop index so both eyes rotate consistently.
         rot_index = (np.random.randint(4)
                      if self.split in ('train', 'finetune') else 0)
+        dzi_rnd = misc.draw_dzi_randoms(
+            self.DZI_SCALE_RATIO, self.DZI_SHIFT_RATIO)
 
         bbox_l = np.asarray(info['bbox'], dtype=np.float32)
         bbox_l = np.array([bbox_l[0], bbox_l[1],
@@ -486,10 +500,10 @@ class UsprobeDataset(BOP_Dataset):
 
         left = self._crop_eye(
             image_l, mask_l, info['intrinsics'], bbox_l, rot_index,
-            im_H, im_W)
+            im_H, im_W, dzi_rnd)
         right = self._crop_eye(
             image_r, mask_r, info['intrinsics_right'], bbox_r, rot_index,
-            im_H, im_W)
+            im_H, im_W, dzi_rnd)
 
         R_l = np.asarray(info['rotation'], dtype=np.float32).reshape(3, 3)
         t_l = np.asarray(info['translation'], dtype=np.float32).reshape(3)

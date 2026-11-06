@@ -37,8 +37,9 @@ Modes:
            pose) plus the right-eye crop inputs and the per-sample rig
            transform ``T_right_ref = [I | -Rz @ (b, 0, 0)]`` (see
            ``PoseSample`` in dataset_schema). Both eyes share the same Rz
-           crop-augmentation index; photometric and DZI augmentation stay
-           per-eye independent.
+           crop-augmentation index and one DZI draw (the same zoom/pan
+           relative to each eye's own bbox, preserving the eval-time stereo
+           geometry); photometric augmentation stays per-eye independent.
 
 Unlike ``BOP_Dataset``, samples do NOT carry ``quat_bin``: the 1M+
 instance table is far too large to precompute and per-sample CPU
@@ -513,12 +514,16 @@ class StereobjDataset(PoseDataset):
             np.frombuffer(mask_buf, np.uint8), cv2.IMREAD_UNCHANGED)
         return label, img_pair, mask_full
 
-    def _read_eye(self, fi, row, eye, label, img_pair, mask_full, rot_index):
+    def _read_eye(self, fi, row, eye, label, img_pair, mask_full, rot_index,
+                  dzi_rnd=None):
         """Crop/augment one eye and return its inputs plus Rz-composed pose.
 
         ``rot_index=None`` draws the Rz crop-augmentation index at the
         original point in the RNG stream (mono path); stereo passes one
-        shared index so both eyes rotate consistently.
+        shared index so both eyes rotate consistently. ``dzi_rnd=None``
+        draws the DZI zoom/pan per eye (mono path); stereo passes one
+        shared draw so both eyes keep the eval-time geometric
+        correspondence (each eye applies it relative to its own bbox).
         """
         x_off = EYE_W if eye == 'right' else 0
         image = np.ascontiguousarray(img_pair[:, x_off:x_off + EYE_W])
@@ -562,7 +567,7 @@ class StereobjDataset(PoseDataset):
                 bbox_xyxy, im_H, im_W,
                 scale_ratio=self.DZI_SCALE_RATIO,
                 shift_ratio=self.DZI_SHIFT_RATIO,
-                pad_scale=self.DZI_PAD_SCALE)
+                pad_scale=self.DZI_PAD_SCALE, rnd=dzi_rnd)
         else:
             bx1, by1, bx2, by2 = bbox_xyxy
             cx = 0.5 * (bx1 + bx2)
@@ -667,17 +672,22 @@ class StereobjDataset(PoseDataset):
     def read_data_stereo(self, fi, row):
         """Build a stereo PoseSample: left-eye targets + right-eye inputs.
 
-        Both eyes share one Rz crop index; the returned left-frame targets
-        are the left-eye Rz-composed pose. The rig transform is
+        Both eyes share one Rz crop index and one DZI draw (the same zoom
+        multiplier and relative pan applied to each eye's own bbox, so the
+        crop pair keeps the geometric correspondence eval builds from the
+        per-eye GT boxes); the returned left-frame targets are the
+        left-eye Rz-composed pose. The rig transform is
         ``T_right_ref = [I | -Rz @ (b, 0, 0)]``.
         """
         label, img_pair, mask_full = self._load_frame_arrays(fi)
         rot_index = (np.random.randint(4)
                      if self.split in ('train', 'finetune') else 0)
+        dzi_rnd = misc.draw_dzi_randoms(
+            self.DZI_SCALE_RATIO, self.DZI_SHIFT_RATIO)
         left = self._read_eye(
-            fi, row, 'left', label, img_pair, mask_full, rot_index)
+            fi, row, 'left', label, img_pair, mask_full, rot_index, dzi_rnd)
         right = self._read_eye(
-            fi, row, 'right', label, img_pair, mask_full, rot_index)
+            fi, row, 'right', label, img_pair, mask_full, rot_index, dzi_rnd)
 
         sample = self._assemble_sample(fi, row, 'left', left)
 
