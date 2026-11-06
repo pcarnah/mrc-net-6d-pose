@@ -7,9 +7,17 @@
 #                                   [max_instances] [output_suffix]
 #
 #   <ckpt_subdir>   directory under CKPT_ROOT, e.g. chkpt_stereobj-1m_mono_K1
+#                   (subdirectories like ablation/chkpt_... are allowed; the
+#                   output tag uses the basename)
 #   <model_name>    checkpoint file stem, e.g. epoch_000 or step_00030000
 #   <stereo_mode>   mono | stereo   (must match the checkpoint's training mode)
-#   [max_instances] val-subset cap, 0 = all (default 500)
+#   [max_instances] val-subset cap, 0 = all (default 500). The subset is
+#                   drawn by stratified sampling across all object types
+#                   (proportional quota, min 1 per type) over the common
+#                   both-eye population: mono and stereo runs select the
+#                   identical instance set for a given seed (mono scores the
+#                   left eye), so checkpoints are directly comparable.
+#                   STRATIFIED=0 restores the legacy first-frames cap.
 #   [output_suffix] extra tag for the output files (default: auto)
 #
 # Examples:
@@ -28,6 +36,10 @@
 #   NUM_WORKERS DataLoader workers for the CPU prep (default: 2). Overlaps
 #                                         decode + crop building with the GPU
 #                                         call; 0 = serial.
+#   STRATIFIED  1 | 0                    (default: 1). 0 disables stratified
+#                                         sampling (legacy first-N-frames
+#                                         subset). The tag gets "_strat" when
+#                                         enabled.
 #
 # Inference runs with --no_compile always, and --single_crop unless CROP=multi
 # (the 4-crop confidence argmax is miscalibrated; see reports/ history).
@@ -52,12 +64,17 @@ EVAL_ROOT="${EVAL_ROOT:-$REPO_DIR/reports}"
 PYTHON="${PYTHON:-$REPO_DIR/.venv/bin/python}"
 CROP="${CROP:-single}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
+STRATIFIED="${STRATIFIED:-1}"
 
 crop_flags=()
 if [ "$CROP" != "multi" ]; then
     crop_flags+=(--single_crop)
 fi
 worker_flags=(--num_workers "$NUM_WORKERS")
+strat_flags=()
+if [ "$STRATIFIED" != "0" ]; then
+    strat_flags+=(--stratified)
+fi
 
 ckpt_dir="$CKPT_ROOT/$CKPT_SUBDIR"
 if [ ! -d "$ckpt_dir" ]; then
@@ -65,9 +82,14 @@ if [ ! -d "$ckpt_dir" ]; then
     exit 1
 fi
 
-run_tag="${CKPT_SUBDIR#chkpt_stereobj-1m_}"
+run_tag="${CKPT_SUBDIR##*/}"
+run_tag="${run_tag#chkpt_stereobj-1m_}"
+ckpt_csv="${CKPT_SUBDIR//\//_}"
 model_tag="${MODEL%.pth}"
 tag="${run_tag}_${model_tag}_n${N}"
+if [ "$STRATIFIED" != "0" ]; then
+    tag="${tag}_strat"
+fi
 if [ -n "$SUFFIX" ]; then
     tag="${tag}_${SUFFIX}"
 fi
@@ -81,13 +103,13 @@ cd "$CKPT_ROOT"
     --checkpoint_name "$CKPT_SUBDIR" --model_name "$MODEL" \
     --output_suffix "$tag" --stereo_mode "$MODE" \
     --max_instances "$N" --no_compile "${crop_flags[@]}" \
-    "${worker_flags[@]}" \
+    "${worker_flags[@]}" "${strat_flags[@]}" \
     --dataset_root "$DATA_ROOT" --eval_root "$EVAL_ROOT"
 
 echo "== scoring =="
 cd "$REPO_DIR"
 "$PYTHON" "$REPO_DIR/tools/eval_stereobj.py" \
-    --results "$EVAL_ROOT/mrcnet_stereobj-1m-val_${CKPT_SUBDIR}_${tag}.csv" \
+    --results "$EVAL_ROOT/mrcnet_stereobj-1m-val_${ckpt_csv}_${tag}.csv" \
     --dataset stereobj-1m --split val --stereo_mode "$MODE" \
     --output "$EVAL_ROOT/${tag}.json"
 

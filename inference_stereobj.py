@@ -224,6 +224,99 @@ def prep_jobs(jobs, preparer, num_workers=0):
         yield item
 
 
+def _stratified_quota(population, budget):
+    """Proportional (largest-remainder) allocation of ``budget`` samples across
+    strata with sizes ``population``, capped at each stratum size and with a
+    minimum of 1 per stratum while the budget allows. Returns an int array
+    aligned with ``population`` summing to ``min(budget, total)``."""
+    population = np.asarray(population, dtype=np.int64)
+    total = int(population.sum())
+    budget = min(int(budget), total)
+    if budget >= total:
+        return population.copy()
+    alloc = np.minimum(population * budget // total, population)
+    remainder = budget - int(alloc.sum())
+    frac = population * budget % total
+    for i in np.argsort(-frac):
+        if remainder <= 0:
+            break
+        add = min(int(population[i] - alloc[i]), remainder)
+        alloc[i] += add
+        remainder -= add
+    if budget >= len(population):
+        for i in np.where(alloc == 0)[0]:
+            donor = int(np.argmax(alloc))
+            alloc[donor] -= 1
+            alloc[i] += 1
+    return alloc
+
+
+def _stratified_subset(frame_rows, i_cls, i_sides, cls_names, budget, seed):
+    """Stratified instance subset over the COMMON both-eye population.
+
+    Strata are the object classes of the rows annotated on both eyes
+    (``sides == 0b11``) -- the population stereo evaluates, and the same
+    instances mono can evaluate on their left-eye row (same view, camera
+    frame and GT key as the stereo row). The per-class quota is proportional
+    (largest-remainder, min 1 per class while the budget allows) and the
+    within-class draw is uniform under a seeded RNG, so mono and stereo runs
+    select the identical instance set for a given ``budget``/``seed`` and
+    checkpoint comparisons are apples-to-apples.
+
+    Returns a new ``{frame_index: [(row, 'left'), ...]}`` covering only the
+    selected both-eye instances.
+    """
+    rng = np.random.default_rng(seed)
+    by_cls = {}
+    for fi, items in frame_rows.items():
+        for row, eye in items:
+            if eye == 'left' and int(i_sides[row]) == 0b11:
+                by_cls.setdefault(int(i_cls[row]), []).append((fi, row))
+    classes = sorted(by_cls)
+    quota = _stratified_quota([len(by_cls[c]) for c in classes], budget)
+    selected = []
+    for c, k in zip(classes, quota):
+        pool = sorted(by_cls[c])
+        selected.extend(pool[i] for i in rng.choice(
+            len(pool), size=int(k), replace=False))
+        print('  strat {}: {}/{} instances'.format(
+            cls_names[c], int(k), len(pool)))
+    subset = {}
+    for fi, row in selected:
+        subset.setdefault(fi, []).append((row, 'left'))
+    print('Stratified subset: {}/{} both-eye instances over {} object types '
+          '(seed={}; identical across mono/stereo)'.format(
+              len(selected), sum(len(v) for v in by_cls.values()),
+              len(classes), seed))
+    return subset
+
+
+def _eye_box(label, obj_key, view_eye, x_off, img_H, img_W):
+    """Scaled GT box of ``obj_key`` in one eye's half-image, as a crop spec."""
+    bb = label['scaled_bboxes'][view_eye][obj_key]
+    x1 = bb['x_min'] - x_off
+    x2 = bb['x_max'] - x_off
+    y1, y2 = bb['y_min'], bb['y_max']
+    cx = min((x1 + x2) / 2.0, img_W)
+    cy = min((y1 + y2) / 2.0, img_H)
+    bw = int(max(0, min(x2 - x1, img_W)))
+    bh = int(max(0, min(y2 - y1, img_H)))
+    return (x1, y1, x2, y2), \
+        max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE, cx, cy
+
+
+class _ZeroCorr(torch.nn.Module):
+    """Inference-time ablation: keep the probe's output shape but zero the
+    correlation volume, so the fusion convs lose the disparity channels."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, input1, input2):
+        return torch.zeros_like(self.inner(input1, input2))
+
+
 class StereobjFramePreparer:
     """Picklable per-frame prep for one ``(frame_index, [(row, eye)...])`` job.
 
@@ -234,13 +327,18 @@ class StereobjFramePreparer:
     spawn) can run it ahead of the GPU call.
     """
 
-    def __init__(self, dataset, stereo, n_rots, dataset_id2cls):
+    def __init__(self, dataset, stereo, n_rots, dataset_id2cls, donors=None):
         self.dataset = dataset
         self.stereo = stereo
         self.n_rots = n_rots
         self.dataset_id2cls = dataset_id2cls
         self.baseline = dataset.baseline
         self.eye_index = {'left': 0, 'right': 1}
+        # --shuffle_right ablation: {row: (donor_fi, donor_row)}; the right
+        # eye is cropped from the donor frame with the donor's bbox geometry
+        # (T_right_ref stays: it only encodes rot_index + baseline, which are
+        # instance-independent).
+        self.donors = donors or {}
 
     def __call__(self, job):
         ds = self.dataset
@@ -266,21 +364,25 @@ class StereobjFramePreparer:
                 int(ds._i_cls[row]), dtype=torch.int64)
             inst_name = ds.cls_names[int(ds._i_cls[row])]
 
-            def eye_box(view_eye, x_off):
-                bb = label['scaled_bboxes'][view_eye][obj_key]
-                x1 = bb['x_min'] - x_off
-                x2 = bb['x_max'] - x_off
-                y1, y2 = bb['y_min'], bb['y_max']
-                cx = min((x1 + x2) / 2.0, img_W)
-                cy = min((y1 + y2) / 2.0, img_H)
-                bw = int(max(0, min(x2 - x1, img_W)))
-                bh = int(max(0, min(y2 - y1, img_H)))
-                return (x1, y1, x2, y2), \
-                    max(bw, bh) * bop_cfg.ZOOM_PAD_SCALE, cx, cy
-
             if self.stereo:
-                box_l, scale_l, cx_l, cy_l = eye_box('left', 0)
-                box_r, scale_r, cx_r, cy_r = eye_box('right', ds.EYE_W)
+                box_l, scale_l, cx_l, cy_l = _eye_box(
+                    label, obj_key, 'left', 0, img_H, img_W)
+                # Right-eye ablation: crop the donor frame's right half with
+                # the donor instance's bbox geometry (content + geometry from
+                # another frame break true stereo correspondence).
+                r_label, r_row, r_image = label, row, right_image
+                if self.donors:
+                    dfi, drow = self.donors.get(int(row), (fi, row))
+                    if drow != int(row):
+                        d_label, d_img_pair, _ = ds._load_frame_arrays(dfi)
+                        r_image = torch.as_tensor(
+                            np.ascontiguousarray(
+                                d_img_pair[:, ds.EYE_W:2 * ds.EYE_W]),
+                            dtype=torch.float32)
+                        r_label, r_row = d_label, drow
+                r_obj_key = 'Object {}'.format(int(ds._i_mask[r_row]) - 1)
+                box_r, scale_r, cx_r, cy_r = _eye_box(
+                    r_label, r_obj_key, 'right', ds.EYE_W, img_H, img_W)
                 b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
                     build_rz_crop_batch(
                         left_image, K_left, box_l, scale_l, cx_l, cy_l,
@@ -288,7 +390,7 @@ class StereobjFramePreparer:
                         n_rots=self.n_rots)
                 _, _, r_roi_rgb, r_bbox_loc, r_roi_camK, r_fov = \
                     build_rz_crop_batch(
-                        right_image, K_right, box_r, scale_r, cx_r, cy_r,
+                        r_image, K_right, box_r, scale_r, cx_r, cy_r,
                         fx_r, fy_r, self.dataset_id2cls, inst_cls,
                         n_rots=self.n_rots)
                 T_right_ref = np.tile(
@@ -308,7 +410,8 @@ class StereobjFramePreparer:
                 view_image = right_image if eye == 'right' else left_image
                 view_K = K_right if eye == 'right' else K_left
                 fx, fy = view_K[0, 0], view_K[1, 1]
-                box, scale, cx, cy = eye_box(eye, x_off)
+                box, scale, cx, cy = _eye_box(
+                    label, obj_key, eye, x_off, img_H, img_W)
                 b_Rz, b_obj_cls, b_roi_rgb, b_bbox_loc, b_roi_camK, b_fov = \
                     build_rz_crop_batch(
                         view_image, view_K, box, scale, cx, cy, fx, fy,
@@ -355,7 +458,27 @@ if __name__ == '__main__':
                              'argmax over the 4 Rz crops (use when the '
                              'classification confidence is miscalibrated)')
     parser.add_argument('--max_instances', type=int, default=0,
-                        help='debug cap on the number of instances (0 = all)')
+                        help='debug cap on the number of instances (0 = all; '
+                             'with --stratified the cap is filled '
+                             'proportionally across object types)')
+    parser.add_argument('--stratified', action='store_true',
+                        help='with --max_instances > 0, draw the subset by '
+                             'stratified sampling across all object types '
+                             'over the common both-eye population (mono '
+                             'scores the left eye), so mono and stereo runs '
+                             'select the identical instance set for a given '
+                             '--seed')
+    parser.add_argument('--seed', type=int, default=bop_cfg.RANDOM_SEED,
+                        help='RNG seed for --stratified subset selection')
+    parser.add_argument('--zero_corr', action='store_true',
+                        help='inference-time ablation: zero the stereo_corr '
+                             'volume so the fusion convs lose the disparity '
+                             'channels')
+    parser.add_argument('--shuffle_right', action='store_true',
+                        help='inference-time ablation: replace each right-eye '
+                             'crop with one from another frame (donor content '
+                             '+ bbox geometry; breaks true stereo '
+                             'correspondence)')
     parser.add_argument('--num_workers', type=int, default=0,
                         help='DataLoader workers prefetching the CPU prep '
                              '(decode + Rz crop building) to overlap the GPU '
@@ -378,8 +501,11 @@ if __name__ == '__main__':
     p = {
         'dataset': args.dataset,
         'eval_root': bop_cfg.EVAL_ROOT,
+        # checkpoint_name may address a subdirectory (e.g. ablation/<name>);
+        # keep the output filename flat (both path separators, Windows-safe)
         'output_suffix_name': '{}_{}'.format(
-            args.checkpoint_name, args.output_suffix),
+            args.checkpoint_name, args.output_suffix).replace(
+                '/', '_').replace('\\', '_'),
         'checkpoint': './{}/{}.pth'.format(args.checkpoint_name,
                                            args.model_name)
     }
@@ -409,6 +535,14 @@ if __name__ == '__main__':
         net.load_state_dict(network)
     net.eval()
     model_stereo = bool(net.stereo_fusion)
+
+    if args.zero_corr:
+        if not getattr(net, 'fusion_corr', False):
+            raise SystemExit('--zero_corr: the checkpoint has no stereo_corr '
+                             'probes (fusion_corr=False)')
+        for probe in list(net.stereo_corr.keys()):
+            net.stereo_corr[probe] = _ZeroCorr(net.stereo_corr[probe])
+        print('ablation: stereo_corr outputs zeroed')
 
     if args.no_compile:
         print('skipping torch.compile (--no_compile)')
@@ -458,10 +592,34 @@ if __name__ == '__main__':
         p['dataset'], 'stereo' if stereo else 'mono', n_inst, len(frame_rows)))
     print(est_pose_file)
 
+    if args.max_instances and args.stratified:
+        frame_rows = _stratified_subset(
+            frame_rows, dataset._i_cls, dataset._i_sides, dataset.cls_names,
+            args.max_instances, args.seed)
+
+    donors = None
+    if args.shuffle_right:
+        if not stereo:
+            raise SystemExit('--shuffle_right requires the stereo dataset '
+                             'mode (mono has no right eye to shuffle)')
+        rng_donors = np.random.default_rng(args.seed + 1)
+        pool = [(fi, row) for fi, items in frame_rows.items()
+                for row, eye in items]
+        donors = {}
+        for fi, row in pool:
+            while True:
+                cand = pool[rng_donors.integers(len(pool))]
+                if cand[1] != row:
+                    donors[row] = cand
+                    break
+        print('ablation: right-eye donors shuffled for {} instances '
+              '(donor seed={})'.format(len(donors), args.seed + 1))
+
     n_rots = 1 if args.single_crop else 4
     stop_thresh = (args.refine_stop_thresh
                    if args.n_refine_iters > 1 else 0.0)
-    preparer = StereobjFramePreparer(dataset, stereo, n_rots, dataset_id2cls)
+    preparer = StereobjFramePreparer(dataset, stereo, n_rots, dataset_id2cls,
+                                     donors=donors)
     jobs = sorted(frame_rows.items())
     pose_results = []
     for payloads, _stats in tqdm(prep_jobs(jobs, preparer, args.num_workers),
